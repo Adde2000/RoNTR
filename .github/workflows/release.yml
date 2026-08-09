@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  ts-plugin-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch TS3 Plugin SDK
+        run: git clone --depth 1 https://github.com/teamspeak/ts3client-pluginsdk third_party/ts3client-pluginsdk
+      - name: Tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -O2 ts3-plugin/tests/test_core.cpp -o rtr_tests
+          ./rtr_tests
+      - name: Build .so
+        run: ./scripts/build-linux-plugin.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ts-plugin-linux
+          path: ts3-plugin/dist/ron_tactical_radio_linux_amd64.so
+
+  ts-plugin-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch TS3 Plugin SDK
+        run: git clone --depth 1 https://github.com/teamspeak/ts3client-pluginsdk third_party/ts3client-pluginsdk
+      - name: Build
+        run: |
+          cmake -S ts3-plugin -B build/ts3-plugin -A x64 -DTS3_PLUGINSDK_DIR="$env:GITHUB_WORKSPACE/third_party/ts3client-pluginsdk"
+          cmake --build build/ts3-plugin --config Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ts-plugin-windows
+          path: build/ts3-plugin/Release/ron_tactical_radio.dll
+
+  game-mod:
+    runs-on: windows-latest
+    env:
+      UEPSEUDO_TOKEN: ${{ secrets.UEPSEUDO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require UEPSEUDO_TOKEN for releases
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrEmpty($env:UEPSEUDO_TOKEN)) {
+            throw "UEPSEUDO_TOKEN secret is required to build the game mod for a release (see docs/RELEASING.md)."
+          }
+      - name: Map SSH submodule URLs to token HTTPS
+        shell: pwsh
+        run: git config --global url."https://x-access-token:${env:UEPSEUDO_TOKEN}@github.com/".insteadOf "git@github.com:"
+      - name: Setup (clone RE-UE4SS + submodules)
+        shell: pwsh
+        run: .\scripts\setup.ps1
+      - name: Build game mod + UE4SS
+        shell: pwsh
+        run: .\scripts\build.ps1 -GameModOnly
+      - name: Assemble game pack
+        shell: pwsh
+        run: .\scripts\assemble-pack.ps1 -OutDir pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: game-pack
+          path: pack/game/
+
+  release:
+    needs: [ts-plugin-linux, ts-plugin-windows, game-mod]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Assemble release pack
+        run: |
+          set -eu
+          PACK=RoN-TacticalRadio-${GITHUB_REF_NAME}
+          mkdir -p "$PACK/game" "$PACK/teamspeak/windows" "$PACK/teamspeak/linux"
+          cp -r artifacts/game-pack/* "$PACK/game/"
+          cp artifacts/ts-plugin-windows/ron_tactical_radio.dll "$PACK/teamspeak/windows/"
+          cp artifacts/ts-plugin-linux/ron_tactical_radio_linux_amd64.so "$PACK/teamspeak/linux/"
+          cp docs/INSTALL-LINUX.md "$PACK/"
+          printf '%s\n' \
+            "Windows: copy the game/ folder contents into" \
+            "<game>\\ReadyOrNot\\Binaries\\Win64\\, and teamspeak\\windows\\ron_tactical_radio.dll" \
+            "into %APPDATA%\\TS3Client\\plugins\\. Enable in TS3 Options > Addons, set capture" \
+            "to Voice Activity Detection. Linux: see INSTALL-LINUX.md." \
+            > "$PACK/INSTALL-WINDOWS.txt"
+          tar -czf "$PACK.tar.gz" "$PACK"
+          zip -qr "$PACK.zip" "$PACK"
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            RoN-TacticalRadio-*.tar.gz
+            RoN-TacticalRadio-*.zip
+          generate_release_notes: true

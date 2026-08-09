@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests-and-linux-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch TS3 Plugin SDK
+        run: git clone --depth 1 https://github.com/teamspeak/ts3client-pluginsdk third_party/ts3client-pluginsdk
+      - name: Host-side tests (DSP, spatial math, UDP transport)
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -O2 ts3-plugin/tests/test_core.cpp -o rtr_tests
+          ./rtr_tests
+      - name: Build Linux TS3 plugin (.so)
+        run: ./scripts/build-linux-plugin.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ts-plugin-linux
+          path: ts3-plugin/dist/ron_tactical_radio_linux_amd64.so
+
+  windows-ts-plugin:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch TS3 Plugin SDK
+        run: git clone --depth 1 https://github.com/teamspeak/ts3client-pluginsdk third_party/ts3client-pluginsdk
+      - name: Build
+        run: |
+          cmake -S ts3-plugin -B build/ts3-plugin -A x64 -DTS3_PLUGINSDK_DIR="$env:GITHUB_WORKSPACE/third_party/ts3client-pluginsdk"
+          cmake --build build/ts3-plugin --config Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ts-plugin-windows
+          path: build/ts3-plugin/Release/ron_tactical_radio.dll
+
+  # The game mod build needs RE-UE4SS's private Unreal submodule (UEPseudo),
+  # which requires the UEPSEUDO_TOKEN secret from an Epic-linked GitHub
+  # account - see docs/RELEASING.md. Runs only when the secret is configured.
+  game-mod:
+    runs-on: windows-latest
+    env:
+      UEPSEUDO_TOKEN: ${{ secrets.UEPSEUDO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Skip if UEPSEUDO_TOKEN is not configured
+        id: gate
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrEmpty($env:UEPSEUDO_TOKEN)) {
+            Write-Host "UEPSEUDO_TOKEN not set - skipping game mod build."
+            "run=false" >> $env:GITHUB_OUTPUT
+          } else { "run=true" >> $env:GITHUB_OUTPUT }
+      - name: Map SSH submodule URLs to token HTTPS
+        if: steps.gate.outputs.run == 'true'
+        run: git config --global url."https://x-access-token:${env:UEPSEUDO_TOKEN}@github.com/".insteadOf "git@github.com:"
+        shell: pwsh
+      - name: Setup (clone RE-UE4SS + submodules)
+        if: steps.gate.outputs.run == 'true'
+        shell: pwsh
+        run: .\scripts\setup.ps1
+      - name: Build game mod + UE4SS
+        if: steps.gate.outputs.run == 'true'
+        shell: pwsh
+        run: .\scripts\build.ps1 -GameModOnly
+      - name: Assemble game pack
+        if: steps.gate.outputs.run == 'true'
+        shell: pwsh
+        run: .\scripts\assemble-pack.ps1 -OutDir pack
+      - uses: actions/upload-artifact@v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          name: game-pack
+          path: pack/game/
