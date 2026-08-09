@@ -10,6 +10,7 @@
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
+#define RTR_MOD_VERSION L"0.3.1"
 #include <winsock2.h> // must precede Windows.h
 #include <ws2tcpip.h>
 #include <Windows.h>
@@ -173,7 +174,7 @@ public:
     RoNTacticalRadioMod()
     {
         ModName = STR("RoNTacticalRadio");
-        ModVersion = STR("0.3.0");
+        ModVersion = RTR_MOD_VERSION;
         ModDescription = STR("Publishes player positions + radio state for the TS3 plugin");
         ModAuthors = STR("Ethan Baxter");
     }
