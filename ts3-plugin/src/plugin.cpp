@@ -31,7 +31,7 @@ static struct TS3Functions ts3Functions;
 
 #define PLUGIN_API_VERSION 26
 #define PLUGIN_NAME "RoN Tactical Radio"
-#define PLUGIN_VERSION "0.3.1"
+#define PLUGIN_VERSION "0.4.0"
 
 #ifdef _WIN32
 #define RTR_EXPORT __declspec(dllexport)
