@@ -70,4 +70,4 @@ Milestones can be found here: [Milestones](https://github.com/Adde2000/RoNTR/mil
 
 
 
-![I make Ready or Not mods.](https://lynxgaming.net/wp-content/uploads/2026/08/image.png)
+![I make Ready or Not mods.](https://lynxgaming.net/wp-content/uploads/2026/08/image-240x300.png)
