@@ -5,19 +5,21 @@
 // Build: as a UE4SS C++ mod against RE-UE4SS (see CMakeLists.txt / README).
 // Install: <game>/Binaries/Win64/ue4ss/Mods/RoNTacticalRadio/dlls/main.dll
 //
-// NOTE: RoN class/property names below are PLACEHOLDERS. Dump the SDK with
-// UE4SS (UHT dump) for your game build and fix the names marked TODO(sdk).
+// Class/property names verified against the RoN UHT dump (see docs/DESIGN.md).
+
+#define RTR_MOD_VERSION L"0.4.0" // keep in step with ts3-plugin PLUGIN_VERSION / release tag
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
-#define RTR_MOD_VERSION L"0.3.1"
 #include <winsock2.h> // must precede Windows.h
 #include <ws2tcpip.h>
 #include <Windows.h>
 #pragma comment(lib, "ws2_32.lib")
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <string>
@@ -41,9 +43,126 @@ using namespace RC::Unreal;
 
 namespace {
 
-constexpr int kPttVKey       = VK_CAPITAL; // radio PTT (TODO: ini-configurable)
-constexpr int kVoiceVKey     = 'V';        // proximity voice key
-constexpr int kCycleVKey     = VK_OEM_6;   // ']' cycle radio channel
+// ------------------------------------------------------------- config ------
+// Read from ue4ss/Mods/RoNTacticalRadio/config.ini (next to the mod folder).
+// A commented default file is written on first run if none exists.
+
+struct RtrConfig {
+    int      pttKey   = VK_CAPITAL; // radio PTT
+    int      voiceKey = 'V';        // reserved (local voice is always on)
+    int      cycleKey = VK_OEM_6;   // ']' cycle radio channel
+    uint32_t freqKhz[RTR_MAX_RADIOS] = {246000, 247000, 0, 0};
+    uint32_t updateMs = 50;         // publish interval (default 20 Hz)
+};
+
+// Directory containing this DLL (…/Mods/RoNTacticalRadio/dlls/).
+std::wstring ModuleDir()
+{
+    HMODULE mod = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&ModuleDir), &mod);
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(mod, path, MAX_PATH);
+    std::wstring s = path;
+    const size_t slash = s.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? s : s.substr(0, slash);
+}
+
+// "CAPSLOCK" / "F5" / "MOUSE4" / "A" / "0x14" -> virtual-key code, -1 if unknown.
+int ParseKeyName(std::string s)
+{
+    for (auto& c : s) c = (char)toupper((unsigned char)c);
+    static const std::unordered_map<std::string, int> named = {
+        {"CAPSLOCK", VK_CAPITAL}, {"TAB", VK_TAB}, {"SPACE", VK_SPACE},
+        {"ENTER", VK_RETURN}, {"BACKSPACE", VK_BACK}, {"ESCAPE", VK_ESCAPE},
+        {"SHIFT", VK_SHIFT}, {"LSHIFT", VK_LSHIFT}, {"RSHIFT", VK_RSHIFT},
+        {"CTRL", VK_CONTROL}, {"LCTRL", VK_LCONTROL}, {"RCTRL", VK_RCONTROL},
+        {"ALT", VK_MENU}, {"LALT", VK_LMENU}, {"RALT", VK_RMENU},
+        {"LBRACKET", VK_OEM_4}, {"RBRACKET", VK_OEM_6},
+        {"SEMICOLON", VK_OEM_1}, {"APOSTROPHE", VK_OEM_7}, {"GRAVE", VK_OEM_3},
+        {"COMMA", VK_OEM_COMMA}, {"PERIOD", VK_OEM_PERIOD},
+        {"SLASH", VK_OEM_2}, {"BACKSLASH", VK_OEM_5},
+        {"MINUS", VK_OEM_MINUS}, {"EQUALS", VK_OEM_PLUS},
+        {"UP", VK_UP}, {"DOWN", VK_DOWN}, {"LEFT", VK_LEFT}, {"RIGHT", VK_RIGHT},
+        {"INSERT", VK_INSERT}, {"DELETE", VK_DELETE}, {"HOME", VK_HOME},
+        {"END", VK_END}, {"PAGEUP", VK_PRIOR}, {"PAGEDOWN", VK_NEXT},
+        {"MOUSE3", VK_MBUTTON}, {"MOUSE4", VK_XBUTTON1}, {"MOUSE5", VK_XBUTTON2},
+    };
+    if (auto it = named.find(s); it != named.end()) return it->second;
+    if (s.size() == 1 && ((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= '0' && s[0] <= '9')))
+        return s[0];
+    if (s.size() >= 2 && s[0] == 'F') { // F1-F24
+        const int n = atoi(s.c_str() + 1);
+        if (n >= 1 && n <= 24) return VK_F1 + n - 1;
+    }
+    if (s.rfind("NUMPAD", 0) == 0 && s.size() == 7 && isdigit((unsigned char)s[6]))
+        return VK_NUMPAD0 + (s[6] - '0');
+    if (s.rfind("0X", 0) == 0) return (int)strtol(s.c_str(), nullptr, 16);
+    return -1;
+}
+
+const char* kDefaultConfig =
+    "; RoN Tactical Radio - game mod configuration\n"
+    "; Key names: A-Z, 0-9, F1-F24, CAPSLOCK, TAB, SPACE, ENTER, SHIFT, CTRL,\n"
+    ";   ALT, LBRACKET, RBRACKET, SEMICOLON, APOSTROPHE, GRAVE, COMMA, PERIOD,\n"
+    ";   SLASH, BACKSLASH, MINUS, EQUALS, arrows, NUMPAD0-9, MOUSE3/4/5,\n"
+    ";   or a raw hex virtual-key code like 0x14.\n"
+    "\n"
+    "[Keybinds]\n"
+    "RadioPTT = CAPSLOCK\n"
+    "CycleChannel = RBRACKET\n"
+    "\n"
+    "[Radio]\n"
+    "; Frequencies in kHz. 0 disables a slot. CycleChannel switches slots.\n"
+    "Freq1 = 246000\n"
+    "Freq2 = 247000\n"
+    "Freq3 = 0\n"
+    "Freq4 = 0\n"
+    "\n"
+    "[Advanced]\n"
+    "; State publish rate in Hz (5-60).\n"
+    "UpdateHz = 20\n";
+
+RtrConfig LoadConfig()
+{
+    RtrConfig cfg{};
+    // dlls/ -> parent folder (Mods/RoNTacticalRadio/config.ini)
+    std::wstring dir = ModuleDir();
+    const size_t slash = dir.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) dir = dir.substr(0, slash);
+    const std::wstring path = dir + L"\\config.ini";
+
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(h, kDefaultConfig, (DWORD)strlen(kDefaultConfig), &written, nullptr);
+            CloseHandle(h);
+        }
+    }
+
+    wchar_t wbuf[64]{};
+    auto readKey = [&](const wchar_t* key, int fallback) {
+        GetPrivateProfileStringW(L"Keybinds", key, L"", wbuf, 64, path.c_str());
+        char nbuf[64]{};
+        WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, nbuf, sizeof(nbuf), nullptr, nullptr);
+        const int vk = ParseKeyName(nbuf);
+        return vk > 0 ? vk : fallback;
+    };
+    cfg.pttKey   = readKey(L"RadioPTT", cfg.pttKey);
+    cfg.cycleKey = readKey(L"CycleChannel", cfg.cycleKey);
+
+    const wchar_t* freqKeys[RTR_MAX_RADIOS] = {L"Freq1", L"Freq2", L"Freq3", L"Freq4"};
+    for (int i = 0; i < RTR_MAX_RADIOS; ++i)
+        cfg.freqKhz[i] = GetPrivateProfileIntW(L"Radio", freqKeys[i], cfg.freqKhz[i], path.c_str());
+
+    uint32_t hz = GetPrivateProfileIntW(L"Advanced", L"UpdateHz", 20, path.c_str());
+    hz = hz < 5 ? 5 : (hz > 60 ? 60 : hz);
+    cfg.updateMs = 1000 / hz;
+    return cfg;
+}
 
 uint64_t NowMs()
 {
@@ -181,26 +300,32 @@ public:
 
     void on_unreal_init() override
     {
+        m_cfg = LoadConfig();
         m_shmOk = m_shm.Open();
         m_udpOk = m_udp.Open();
         m_talkRx.Open();
         Output::send<LogLevel::Verbose>(STR("[RoNTacticalRadio] shared memory {}, udp {}\n"),
                                         m_shmOk ? STR("ready") : STR("FAILED"),
                                         m_udpOk ? STR("ready") : STR("FAILED"));
+        Output::send<LogLevel::Verbose>(
+            STR("[RoNTacticalRadio] config: ptt=0x{:X} cycle=0x{:X} freqs={},{},{},{} kHz rate={}ms\n"),
+            m_cfg.pttKey, m_cfg.cycleKey,
+            m_cfg.freqKhz[0], m_cfg.freqKhz[1], m_cfg.freqKhz[2], m_cfg.freqKhz[3],
+            m_cfg.updateMs);
     }
 
     void on_update() override
     {
         // Throttle to ~20 Hz; on_update runs every frame.
         const uint64_t now = NowMs();
-        if (now - m_lastPublish < 50) return;
+        if (now - m_lastPublish < m_cfg.updateMs) return;
         m_lastPublish = now;
         if (!m_shmOk && !m_udpOk) return;
 
         RtrSharedState s{};
         s.timestampMs = now;
-        s.radioPtt  = (GetAsyncKeyState(kPttVKey)   & 0x8000) ? 1 : 0;
-        s.voicePtt  = (GetAsyncKeyState(kVoiceVKey) & 0x8000) ? 1 : 0;
+        s.radioPtt  = (GetAsyncKeyState(m_cfg.pttKey)   & 0x8000) ? 1 : 0;
+        s.voicePtt  = (GetAsyncKeyState(m_cfg.voiceKey) & 0x8000) ? 1 : 0;
         if (s.radioPtt != m_prevRadioPtt) {
             Output::send<LogLevel::Verbose>(STR("[RoNTacticalRadio] radio PTT {}\n"),
                                             s.radioPtt ? STR("DOWN") : STR("UP"));
@@ -212,9 +337,7 @@ public:
             m_prevVoicePtt = s.voicePtt;
         }
         HandleChannelCycle(s);
-        // TODO(config): load from ini. Defaults: two program slots.
-        s.radioFreqKhz[0] = 246000;
-        s.radioFreqKhz[1] = 247000;
+        for (int i = 0; i < RTR_MAX_RADIOS; ++i) s.radioFreqKhz[i] = m_cfg.freqKhz[i];
         s.activeRadio = m_activeRadio;
 
         CollectGameState(s);
@@ -238,8 +361,14 @@ public:
 private:
     void HandleChannelCycle(RtrSharedState& s)
     {
-        const bool down = (GetAsyncKeyState(kCycleVKey) & 0x8000) != 0;
-        if (down && !m_cycleWasDown) m_activeRadio = (m_activeRadio + 1) % 2;
+        const bool down = (GetAsyncKeyState(m_cfg.cycleKey) & 0x8000) != 0;
+        if (down && !m_cycleWasDown) {
+            // Advance to the next enabled (nonzero) frequency slot.
+            for (int i = 1; i <= RTR_MAX_RADIOS; ++i) {
+                const uint8_t next = uint8_t((m_activeRadio + i) % RTR_MAX_RADIOS);
+                if (m_cfg.freqKhz[next] != 0) { m_activeRadio = next; break; }
+            }
+        }
         m_cycleWasDown = down;
         (void)s;
     }
@@ -473,6 +602,7 @@ private:
         m_activeMouths = std::move(nowTalking);
     }
 
+    RtrConfig m_cfg{};
     SharedMemWriter m_shm{};
     UdpSender m_udp{};
     TalkReceiver m_talkRx{};
