@@ -7,7 +7,7 @@
 //
 // Class/property names verified against the RoN UHT dump (see docs/DESIGN.md).
 
-#define RTR_MOD_VERSION L"0.4.0" // keep in step with ts3-plugin PLUGIN_VERSION / release tag
+#define RTR_MOD_VERSION L"0.4.3" // keep in step with ts3-plugin PLUGIN_VERSION / release tag
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -314,8 +314,25 @@ public:
             m_cfg.updateMs);
     }
 
+    // on_update wraps the real tick in SEH: during level transitions,
+    // reflected calls can touch objects that are mid-destruction (a much
+    // wider window under Wine/Proton, where this crashed the game). A
+    // faulted tick is skipped; the next tick runs against the settled world.
     void on_update() override
     {
+        __try { TickBody(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { ++m_faults; }
+    }
+
+    void TickBody()
+    {
+        if (m_faults != m_faultsLogged) {
+            m_faultsLogged = m_faults;
+            Output::send<LogLevel::Warning>(
+                STR("[RoNTacticalRadio] skipped {} faulted tick(s) during level transition\n"),
+                m_faults);
+        }
+
         // Throttle to ~20 Hz; on_update runs every frame.
         const uint64_t now = NowMs();
         if (now - m_lastPublish < m_cfg.updateMs) return;
@@ -446,17 +463,40 @@ private:
     //   AReadyOrNotPlayerState : APlayerState -> GetPlayerName(), GetPawn()
     //   AActor::K2_GetActorLocation()
     //   AReadyOrNotCharacter::IsDeadOrUnconscious()
-    // First live (non-CDO) instance of the player controller. FindFirstOf can
-    // hand back the class default object, whose camera manager is null.
-    static UObject* FindLivePlayerController()
+    // The LOCAL player's controller. Critical on a listen server (host):
+    // the host's process contains a PlayerController for EVERY connected
+    // player, and after level transitions their ordering changes - grabbing
+    // "the first live one" sometimes returned a remote player's controller
+    // (positions were then relative to THEIR head: flipped/wrong audio).
+    static UObject* FindLocalPlayerController()
     {
+        // Any live world object to use as world context for GameplayStatics.
+        UObject* ctx = nullptr;
+        std::vector<UObject*> states{};
+        UObjectGlobals::FindAllOf(STR("ReadyOrNotPlayerState"), states);
+        for (UObject* s : states) {
+            if (s && !s->HasAnyFlags(Unreal::EObjectFlags::RF_ClassDefaultObject)) { ctx = s; break; }
+        }
+        if (ctx) {
+            UObject* gs = UObjectGlobals::StaticFindObject<UObject*>(
+                nullptr, nullptr, STR("/Script/Engine.Default__GameplayStatics"));
+            if (gs) {
+                if (UFunction* fn = gs->GetFunctionByNameInChain(STR("GetPlayerController"))) {
+                    struct { UObject* Ctx; int32_t PlayerIndex; UObject* ReturnValue; }
+                        p{ctx, 0, nullptr};
+                    gs->ProcessEvent(fn, &p);
+                    if (p.ReturnValue) return p.ReturnValue;
+                }
+            }
+        }
+        // Fallback: first live controller that claims to be local.
         for (const auto* name : {STR("ReadyOrNotPlayerController"), STR("PlayerController")}) {
             std::vector<UObject*> pcs{};
             UObjectGlobals::FindAllOf(name, pcs);
             for (UObject* pc : pcs) {
                 if (!pc) continue;
                 if (pc->HasAnyFlags(Unreal::EObjectFlags::RF_ClassDefaultObject)) continue;
-                return pc;
+                if (CallBool(pc, STR("IsLocalPlayerController"), true)) return pc;
             }
         }
         return nullptr;
@@ -464,22 +504,24 @@ private:
 
     void CollectGameState(RtrSharedState& s)
     {
-        UObject* pc = FindLivePlayerController();
+        UObject* pc = FindLocalPlayerController();
         if (!pc) { s.inGame = 0; return; }
+
+        // No possessed pawn = loading screen / menus / not spawned yet:
+        // report not-in-game so TeamSpeak behaves like normal TS.
+        UObject* myPawn = CallObj(pc, STR("K2_GetPawn"));
+        if (!myPawn) { s.inGame = 0; return; }
         s.inGame = 1;
 
-        // --- Listener transform: camera manager, with controller fallbacks ---
-        // Found as a live instance (like PlayerStates) rather than through the
-        // PlayerCameraManager property: reflected function calls work reliably
-        // here, but the property-by-name read returned null on live PCs.
+        // --- Listener transform: OUR camera manager, with fallbacks ---
+        // Matched by owner: on a host there is a camera manager per player.
         UObject* camMgr = nullptr;
         for (const auto* name : {STR("ReadyOrNotPlayerCameraManager"), STR("PlayerCameraManager")}) {
             std::vector<UObject*> mgrs{};
             UObjectGlobals::FindAllOf(name, mgrs);
             for (UObject* m : mgrs) {
                 if (!m || m->HasAnyFlags(Unreal::EObjectFlags::RF_ClassDefaultObject)) continue;
-                camMgr = m;
-                break;
+                if (CallObj(m, STR("GetOwningPlayerController")) == pc) { camMgr = m; break; }
             }
             if (camMgr) break;
         }
@@ -488,14 +530,12 @@ private:
         bool gotLoc = camMgr && CallVec(camMgr, STR("GetCameraLocation"), camLoc);
         bool gotRot = camMgr && CallRot(camMgr, STR("GetCameraRotation"), camRot);
 
-        // Fallbacks: control rotation from the controller, location from the pawn.
+        // Fallbacks: control rotation from the controller, location from our pawn.
         bool locFromPawn = false;
         if (!gotRot) gotRot = CallRot(pc, STR("GetControlRotation"), camRot);
         if (!gotLoc) {
-            if (UObject* pawn = CallObj(pc, STR("K2_GetPawn"))) {
-                gotLoc = CallVec(pawn, STR("K2_GetActorLocation"), camLoc);
-                locFromPawn = gotLoc;
-            }
+            gotLoc = CallVec(myPawn, STR("K2_GetActorLocation"), camLoc);
+            locFromPawn = gotLoc;
         }
 
         if ((!gotLoc || !gotRot) && NowMs() - m_lastCamWarn > 5000) {
@@ -546,24 +586,6 @@ private:
             CallNameUtf8(*psPtr, STR("GetPlayerName"), s.localName, RTR_NAME_LEN);
     }
 
-    // Face anim instance for a pawn (cached; resolved via
-    // ReadyOrNotFaceAnimInstance -> GetOwningComponent -> GetOwner == pawn).
-    UObject* FindFaceAnim(const std::string& name, UObject* pawn)
-    {
-        auto it = m_faceCache.find(name);
-        if (it != m_faceCache.end()) return it->second;
-
-        std::vector<UObject*> anims{};
-        UObjectGlobals::FindAllOf(STR("ReadyOrNotFaceAnimInstance"), anims);
-        for (UObject* anim : anims) {
-            if (!anim || anim->HasAnyFlags(Unreal::EObjectFlags::RF_ClassDefaultObject)) continue;
-            UObject* comp = CallObj(anim, STR("GetOwningComponent"));
-            UObject* owner = comp ? CallObj(comp, STR("GetOwner")) : nullptr;
-            if (owner == pawn) { m_faceCache[name] = anim; return anim; }
-        }
-        return nullptr;
-    }
-
     static bool SetMouthAlpha(UObject* anim, float alpha)
     {
         float* p = anim->GetValuePtrByPropertyNameInChain<float>(STR("VoipMouthAlpha"));
@@ -574,30 +596,49 @@ private:
 
     // Drives VoipMouthAlpha on each speaking character from TS loudness.
     // m_pawns is rebuilt by CollectGameState each tick (name -> pawn).
+    //
+    // IMPORTANT: face anim instances are resolved FRESH each tick and never
+    // cached across ticks - level transitions destroy them, and a stale
+    // pointer crashes the game (caused crashes on mission load in 0.3/0.4.0).
+    // Same-tick pointers are safe: GC doesn't run mid-tick on the game thread.
     void PumpTalkState(bool inGame)
     {
         RtrTalkMsg msg{};
         if (m_talkRx.Poll(msg)) m_talk = msg;
-        if (!inGame) { m_faceCache.clear(); m_activeMouths.clear(); return; }
+        if (!inGame) { m_activeMouths.clear(); return; }
+        if (m_talk.count == 0 && m_activeMouths.empty()) return; // idle: no work
+
+        // pawn -> face anim map, valid for this tick only.
+        std::unordered_map<UObject*, UObject*> faceByPawn;
+        std::vector<UObject*> anims{};
+        UObjectGlobals::FindAllOf(STR("ReadyOrNotFaceAnimInstance"), anims);
+        for (UObject* anim : anims) {
+            if (!anim || anim->HasAnyFlags(Unreal::EObjectFlags::RF_ClassDefaultObject)) continue;
+            UObject* comp = CallObj(anim, STR("GetOwningComponent"));
+            UObject* owner = comp ? CallObj(comp, STR("GetOwner")) : nullptr;
+            if (owner) faceByPawn[owner] = anim;
+        }
+        auto faceFor = [&](const std::string& name) -> UObject* {
+            auto pw = m_pawns.find(name);
+            if (pw == m_pawns.end() || !pw->second) return nullptr;
+            auto it = faceByPawn.find(pw->second);
+            return it == faceByPawn.end() ? nullptr : it->second;
+        };
 
         std::vector<std::string> nowTalking;
         for (uint32_t i = 0; i < m_talk.count && i < RTR_TALK_MAX; ++i) {
             const std::string name = m_talk.speakers[i].name;
-            auto pw = m_pawns.find(name);
-            if (pw == m_pawns.end() || !pw->second) continue;
-            UObject* anim = FindFaceAnim(name, pw->second);
-            if (!anim || !SetMouthAlpha(anim, std::min(1.0f, m_talk.speakers[i].amplitude))) {
-                m_faceCache.erase(name); // stale cache entry; re-resolve next tick
-                continue;
-            }
+            UObject* anim = faceFor(name);
+            if (!anim) continue;
+            if (!SetMouthAlpha(anim, std::min(1.0f, m_talk.speakers[i].amplitude))) continue;
             nowTalking.push_back(name);
         }
 
-        // Close mouths that stopped talking.
+        // Close mouths that stopped talking (re-resolved this tick; if the
+        // character no longer exists there is nothing to close).
         for (const std::string& name : m_activeMouths) {
             if (std::find(nowTalking.begin(), nowTalking.end(), name) != nowTalking.end()) continue;
-            auto it = m_faceCache.find(name);
-            if (it != m_faceCache.end() && it->second) SetMouthAlpha(it->second, 0.0f);
+            if (UObject* anim = faceFor(name)) SetMouthAlpha(anim, 0.0f);
         }
         m_activeMouths = std::move(nowTalking);
     }
@@ -607,8 +648,7 @@ private:
     UdpSender m_udp{};
     TalkReceiver m_talkRx{};
     RtrTalkMsg m_talk{};
-    std::unordered_map<std::string, UObject*> m_pawns;     // this tick's players
-    std::unordered_map<std::string, UObject*> m_faceCache; // name -> face anim
+    std::unordered_map<std::string, UObject*> m_pawns; // this tick's players
     std::vector<std::string> m_activeMouths;
     bool     m_shmOk = false;
     bool     m_udpOk = false;
@@ -617,6 +657,8 @@ private:
     uint8_t  m_prevRadioPtt = 0;
     uint8_t  m_prevVoicePtt = 0;
     uint64_t m_lastCamWarn = 0;
+    uint32_t m_faults = 0;
+    uint32_t m_faultsLogged = 0;
     uint8_t  m_activeRadio = 0;
     bool     m_cycleWasDown = false;
 };
