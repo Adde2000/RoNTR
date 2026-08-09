@@ -40,19 +40,23 @@ to avoid doubled audio.
 3. Install TeamSpeak plugin
     - Copy the `ron_tactical_radio.dll` file to `C:\Users\user\AppData\Roaming\TS3Client\plugins`
     - Restart TeamSpeak
-    - In TeamSpeak, go to `Tools > Options > Addons` and verify that RoN Tactical Radio is installed, enabled and with the expected version
+    - In TeamSpeak, go to `Tools → Options → Addons` and verify that RoN Tactical Radio is installed, enabled and with the expected version
 
-### Linux
+### Linux (Tested with Proton 11.0)
 
 1. Download the mod and TeamSpeak 3 plugin (links are WIP)
 
 2. Install game mod
     - Copy the `ue4ss` folder and `dwmapi.dll` file to `/Steam/steamapps/common/Ready Or Not/ReadyOrNot/Binaries/Win64/`
+    - In Steam: Ready or Not → Properties → Launch Options:
+        ```
+        WINEDLLOVERRIDES="dwmapi=n,b" %command%
+        ```
 
 3. Install TeamSpeak plugin
     - Copy the `ron_tactical_radio_linux_amd64.so` file to `/home/user/.var/app/com.teamspeak.TeamSpeak3/.ts3client/plugins/`
     - Restart TeamSpeak
-    - In TeamSpeak, go to `Tools > Options > Addons` and verify that RoN Tactical Radio is installed, enabled and with the expected version
+    - In TeamSpeak, go to `Tools → Options → Addons` and verify that RoN Tactical Radio is installed, enabled and with the expected version
 
 ## Build & deploy (automated)
 
