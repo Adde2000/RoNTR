@@ -59,12 +59,9 @@ cd ts3-plugin
 cmake -B build -DRTR_BUILD_TESTS=ON && cmake --build build && ./build/rtr_tests
 ```
 
-## Next steps (design doc milestones)
+## Next steps
 
-- **M1:** in-game smoke test — verify positions appear in the TS plugin log.
-- **M2:** tune proximity falloff in `radio_dsp.hpp`.
-- **M3:** radio UX — freq config ini, channel cycle feedback, squelch clicks.
-- **M4:** occlusion, dual-path (radio + direct) mixing, installer packaging.
+Milestones can be found here: [Milestones](https://github.com/Adde2000/RoNTR/milestones)
 
 ## Keys (defaults, in `dllmain.cpp`)
 
