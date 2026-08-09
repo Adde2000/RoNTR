@@ -28,19 +28,28 @@ $proxyDll = Get-ChildItem -Recurse $outRoot -Filter 'dwmapi.dll' -ErrorAction Si
 $assets   = Join-Path $build 'MyMods\RE-UE4SS\assets'
 
 if ($modDll -and $ue4ssDll) {
+    # SLIM end-user layout: no dev GUI/console, no default UE4SS mods -
+    # just the runtime, a quiet settings file, and our mod.
     $g = Join-Path $OutDir 'game'
     New-Item -ItemType Directory -Force -Path (Join-Path $g 'ue4ss') | Out-Null
     Copy-Item $ue4ssDll.FullName (Join-Path $g 'ue4ss\UE4SS.dll')
     if ($proxyDll) { Copy-Item $proxyDll.FullName (Join-Path $g 'dwmapi.dll') }
-    Copy-Item (Join-Path $assets 'UE4SS-settings.ini') (Join-Path $g 'ue4ss')
-    Copy-Item -Recurse (Join-Path $assets 'Mods') (Join-Path $g 'ue4ss\Mods')
+
+    # Settings: start from the RE-UE4SS defaults (keys track upstream), then
+    # switch off developer features for end users.
+    $ini = Get-Content (Join-Path $assets 'UE4SS-settings.ini')
+    $ini = $ini -replace '^ConsoleEnabled = .*',          'ConsoleEnabled = 0'
+    $ini = $ini -replace '^GuiConsoleEnabled = .*',       'GuiConsoleEnabled = 0'
+    $ini = $ini -replace '^GuiConsoleVisible = .*',       'GuiConsoleVisible = 0'
+    $ini = $ini -replace '^EnableHotReloadSystem = .*',   'EnableHotReloadSystem = 0'
+    $ini | Set-Content (Join-Path $g 'ue4ss\UE4SS-settings.ini')
+
+    # Mods: ONLY ours (no BPModLoader/ConsoleEnabler/ActorDumper/etc.).
     $modDir = Join-Path $g 'ue4ss\Mods\RoNTacticalRadio\dlls'
     New-Item -ItemType Directory -Force -Path $modDir | Out-Null
     Copy-Item $modDll.FullName (Join-Path $modDir 'main.dll')
-    $modsTxt = Join-Path $g 'ue4ss\Mods\mods.txt'
-    $existing = if (Test-Path $modsTxt) { @(Get-Content $modsTxt) } else { @() }
-    @('RoNTacticalRadio : 1') + $existing | Set-Content $modsTxt
-    Write-Host "game/ assembled" -ForegroundColor Green
+    Set-Content (Join-Path $g 'ue4ss\Mods\mods.txt') 'RoNTacticalRadio : 1'
+    Write-Host "game/ assembled (slim: consoles off, single mod)" -ForegroundColor Green
 } else {
     Write-Warning "Game mod / UE4SS outputs not found under $outRoot - game/ skipped."
 }
