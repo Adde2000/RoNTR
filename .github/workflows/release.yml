@@ -41,7 +41,7 @@ jobs:
           path: build/ts3-plugin/Release/ron_tactical_radio.dll
 
   game-mod:
-    runs-on: windows-latest
+    runs-on: self-hosted
     env:
       UEPSEUDO_TOKEN: ${{ secrets.UEPSEUDO_TOKEN }}
     steps:
