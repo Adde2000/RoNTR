@@ -6,7 +6,7 @@
 //   https://github.com/teamspeak/ts3client-pluginsdk
 // Install: %APPDATA%/TS3Client/plugins/ron_tactical_radio.dll
 
-#define PLUGIN_VERSION "0.4.2" // keep in step with game-mod ModVersion / release tag
+#define PLUGIN_VERSION "0.4.3" // keep in step with game-mod ModVersion / release tag
 #define PLUGIN_NAME "RoN Tactical Radio"
 #define PLUGIN_API_VERSION 26
 
@@ -170,6 +170,7 @@ static void pollLoop()
     bool sentHello = false;
     uint32_t lastFreq = 0;
     int micApplied = -1; // -1 = TS default (not gated), 0 = closed, 1 = open
+    uint64_t lastActiveMs = 0; // last time the game link was active
 
     while (s_running.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -197,11 +198,15 @@ static void pollLoop()
 
         if (!ok || !st.inGame) {
             if (micApplied != -1) { setMicOpen(true); micApplied = -1; } // restore normal TS
-            if (sentHello) { tsLog("game link lost (menu or game closed)"); restoreNickname(); }
+            if (sentHello) tsLog("game link inactive (loading screen or menu)");
+            // Hysteresis: loading screens toggle the link constantly - only
+            // restore the nickname after we've been out of game for a while.
+            if (lastActiveMs != 0 && nowMs() - lastActiveMs > 15000) restoreNickname();
             lastRadioPtt = false;
             sentHello = false;
             continue;
         }
+        lastActiveMs = nowMs();
 
         if (!sentHello) {
             tsLog(std::string("game link active: local player '") + st.localName +

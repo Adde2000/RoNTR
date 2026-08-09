@@ -7,7 +7,7 @@
 //
 // Class/property names verified against the RoN UHT dump (see docs/DESIGN.md).
 
-#define RTR_MOD_VERSION L"0.4.2" // keep in step with ts3-plugin PLUGIN_VERSION / release tag
+#define RTR_MOD_VERSION L"0.4.3" // keep in step with ts3-plugin PLUGIN_VERSION / release tag
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -314,8 +314,25 @@ public:
             m_cfg.updateMs);
     }
 
+    // on_update wraps the real tick in SEH: during level transitions,
+    // reflected calls can touch objects that are mid-destruction (a much
+    // wider window under Wine/Proton, where this crashed the game). A
+    // faulted tick is skipped; the next tick runs against the settled world.
     void on_update() override
     {
+        __try { TickBody(); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { ++m_faults; }
+    }
+
+    void TickBody()
+    {
+        if (m_faults != m_faultsLogged) {
+            m_faultsLogged = m_faults;
+            Output::send<LogLevel::Warning>(
+                STR("[RoNTacticalRadio] skipped {} faulted tick(s) during level transition\n"),
+                m_faults);
+        }
+
         // Throttle to ~20 Hz; on_update runs every frame.
         const uint64_t now = NowMs();
         if (now - m_lastPublish < m_cfg.updateMs) return;
@@ -640,6 +657,8 @@ private:
     uint8_t  m_prevRadioPtt = 0;
     uint8_t  m_prevVoicePtt = 0;
     uint64_t m_lastCamWarn = 0;
+    uint32_t m_faults = 0;
+    uint32_t m_faultsLogged = 0;
     uint8_t  m_activeRadio = 0;
     bool     m_cycleWasDown = false;
 };
