@@ -28,7 +28,7 @@ Note: vanilla RoN has a built-in proximity VOIP (`UProximityVoiceComponent`,
 `EVoiceType{VT_Local,VT_Team}`) — disable in-game voice while using this mod
 to avoid doubled audio.
 
-## Install instructions (WIP)
+## Installation instructions (WIP)
 
 ### Windows
 
@@ -60,10 +60,12 @@ to avoid doubled audio.
 
 ## Build & deploy (automated)
 
-Prerequisites (one-time installs): Git, CMake 3.22+, Visual Studio 2022 with
-the Desktop C++ workload, Rust via [rustup.rs](https://rustup.rs) (RE-UE4SS
-dependency), and a GitHub account linked to Epic Games (RE-UE4SS's Unreal
-submodule — see [docs.ue4ss.com](https://docs.ue4ss.com/guides/creating-a-c++-mod.html)).
+Prerequisites (one-time installs): 
+* Git
+* CMake 3.22+
+* Visual Studio 2022+ with the Desktop C++ workload
+* Rust via [rustup.rs](https://rustup.rs) (RE-UE4SSdependency)
+* A GitHub account linked to Epic Games (RE-UE4SS's Unrealsubmodule — see [docs.ue4ss.com](https://docs.ue4ss.com/guides/creating-a-c++-mod.html)).
 
 Then, in PowerShell:
 
@@ -98,6 +100,7 @@ Milestones can be found here: [Milestones](https://github.com/Adde2000/RoNTR/mil
 - Caps Lock — radio PTT (local voice is always on, no key needed)
 - ] — cycle radio channel
 
+Keybinds can be changed in the `config.ini` file. 
 
 
 ![I make Ready or Not mods.](https://lynxgaming.net/wp-content/uploads/2026/08/image-240x300.png)
