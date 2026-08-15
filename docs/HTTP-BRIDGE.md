@@ -12,6 +12,12 @@ response carries back who is currently audible in TeamSpeak (for talk
 indicators / mouth animation). That's the whole protocol — one endpoint each
 way, plain text, no dependencies.
 
+> **The bridge is a compile-time plugin option, OFF by default.** Integrations
+> need a plugin built with it enabled: `scripts\build.ps1 -TsPluginOnly
+> -HttpBridge` (Windows) or `RTR_HTTP_BRIDGE=1 ./scripts/build-linux-plugin.sh`
+> (Linux). A bridge-free plugin logs `http bridge disabled (build option)` at
+> load and does not listen on the port at all.
+
 ```
 game mod --- POST /state (10 Hz) --->  127.0.0.1:39442 (TS plugin)
          <-- 200 + talk list --------

@@ -466,6 +466,11 @@ private:
     // instead of memory: a failed resolve disables occlusion, it never
     // corrupts the frame.
 
+    // Camera farther than this from the possessed pawn = a menu/map camera
+    // (loadout, mission select). First-person + camera shake never exceeds
+    // a few meters; menu scenes are hundreds away.
+    static constexpr double kCamDetachCm     = 1000.0; // 10 m
+
     static constexpr int    kMaxWallCount    = 4;      // trace cap per speaker
     static constexpr int    kOcclusionPerWall = 85;    // RtrPlayer::occlusion units
     static constexpr double kHeadOffsetCm    = 160.0;  // pawn root -> approx head
@@ -517,7 +522,9 @@ private:
         tc.offRet        = off(STR("ReturnValue"));
         if (FProperty* hit = fn->FindProperty(FName(STR("OutHit"), FNAME_Find))) {
             tc.offOutHit = hit->GetOffset_Internal();
-            if (auto* hs = static_cast<FStructProperty*>(hit)->GetStruct())
+            // Explicit type: GetStruct() returns TObjectPtr<UScriptStruct> in
+            // newer RE-UE4SS (raw pointer before) — both convert to this.
+            if (UScriptStruct* hs = static_cast<FStructProperty*>(hit)->GetStruct())
                 if (FProperty* loc = hs->FindProperty(FName(STR("Location"), FNAME_Find)))
                     tc.offHitLoc = loc->GetOffset_Internal(); // LWC FVector: 3 doubles
         }
@@ -681,6 +688,7 @@ private:
 
     void CollectGameState(RtrSharedState& s)
     {
+        m_myPs = nullptr; // same-tick pointer, re-resolved every tick
         UObject* pc = FindLocalPlayerController();
         if (!pc) { s.inGame = 0; return; }
 
@@ -723,6 +731,29 @@ private:
                 gotLoc ? STR("ok") : STR("MISSING"),
                 gotRot ? STR("ok") : STR("MISSING"));
         }
+        // Menu cameras (loadout, mission select) fly far from the pawn while
+        // OTHER players still hear us at the pawn — so listen from the pawn
+        // too, or the menu user loses all proximity voice (camera is past
+        // the falloff range) while still being heard by everyone.
+        FVecD myLoc{};
+        if (gotLoc && !locFromPawn && CallVec(myPawn, STR("K2_GetActorLocation"), myLoc)) {
+            const double dx = camLoc.X - myLoc.X, dy = camLoc.Y - myLoc.Y,
+                         dz = camLoc.Z - myLoc.Z;
+            const bool detached = dx * dx + dy * dy + dz * dz > kCamDetachCm * kCamDetachCm;
+            if (detached) {
+                camLoc = myLoc;
+                camLoc.Z += kHeadOffsetCm;
+                CallRot(myPawn, STR("K2_GetActorRotation"), camRot); // face with the body
+            }
+            if (detached != m_camDetached) {
+                m_camDetached = detached;
+                Output::send<LogLevel::Verbose>(
+                    STR("[RoNTacticalRadio] listener {} pawn (menu camera {})\n"),
+                    detached ? STR("snapped to") : STR("back on"),
+                    detached ? STR("detected") : STR("closed"));
+            }
+        }
+
         s.listenerPos = ToMeters(camLoc);
         if (locFromPawn) s.listenerPos.z += 1.6f; // pawn root -> approx head height
         // Trace origin in UE cm, mirroring the head-height fixup above.
@@ -762,10 +793,13 @@ private:
         }
         s.playerCount = n;
 
-        // --- Local player name ---
+        // --- Local player name + state (state pointer valid this tick only) ---
         UObject** psPtr = pc->GetValuePtrByPropertyNameInChain<UObject*>(STR("PlayerState"));
-        if (psPtr && *psPtr)
+        if (psPtr && *psPtr) {
             CallNameUtf8(*psPtr, STR("GetPlayerName"), s.localName, RTR_NAME_LEN);
+            m_myPs = *psPtr;
+            m_localName = s.localName;
+        }
     }
 
     static bool SetMouthAlpha(UObject* anim, float alpha)
@@ -787,7 +821,16 @@ private:
     {
         RtrTalkMsg msg{};
         if (m_talkRx.Poll(msg)) m_talk = msg;
-        if (!inGame) { m_activeMouths.clear(); return; }
+        if (!inGame) { m_activeMouths.clear(); m_selfTalkSent = -1; return; }
+
+        // Native talking indicators: each client reports its OWN talk state
+        // (Server_PushToTalk is an owning-client RPC). IsTalking replicates,
+        // so the stock VOIP talker HUD lights up on every machine — this is
+        // how "who is talking" shows in-game with TS carrying the voice.
+        bool meTalking = false;
+        for (uint32_t i = 0; i < m_talk.count && i < RTR_TALK_MAX; ++i)
+            if (m_localName == m_talk.speakers[i].name) { meTalking = true; break; }
+
         if (m_talk.count == 0 && m_activeMouths.empty()) return; // idle: no work
 
         // pawn -> face anim map, valid for this tick only.
@@ -825,6 +868,20 @@ private:
         m_activeMouths = std::move(nowTalking);
     }
 
+    // Report our own talk state to the game once per change. m_myPs is a
+    // same-tick pointer set by CollectGameState (never cached across ticks).
+    void SyncSelfTalking(bool talking)
+    {
+        if (!m_myPs) return;
+        const int8_t want = talking ? 1 : 0;
+        if (m_selfTalkSent == want) return;
+        UFunction* fn = Fn(m_myPs, STR("Server_PushToTalk"));
+        if (!fn) return;
+        struct { bool bPushToTalk; } p{talking};
+        m_myPs->ProcessEvent(fn, &p);
+        m_selfTalkSent = want;
+    }
+
     RtrConfig m_cfg{};
     SharedMemWriter m_shm{};
     UdpSender m_udp{};
@@ -832,6 +889,10 @@ private:
     RtrTalkMsg m_talk{};
     std::unordered_map<std::string, UObject*> m_pawns; // this tick's players
     std::vector<std::string> m_activeMouths;
+    UObject* m_myPs = nullptr;    // local PlayerState, THIS tick only
+    std::string m_localName;      // local player's in-game name
+    int8_t m_selfTalkSent = -1;   // last Server_PushToTalk sent; -1 unknown
+    bool m_camDetached = false;   // menu camera far from pawn (log on change)
     bool     m_shmOk = false;
     bool     m_udpOk = false;
     uint64_t m_lastPublish = 0;

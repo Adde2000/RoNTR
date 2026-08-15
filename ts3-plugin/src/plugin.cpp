@@ -221,8 +221,13 @@ static void sendTalkMsg(const RtrTalkMsg& msg)
              reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
 }
 
-// Snapshot of who is audible right now. Shared by the UDP reverse channel
-// (RoN) and the HTTP bridge response (Arma Reforger).
+// Our own mic: onEditPostProcessVoiceDataEvent only sees REMOTE voices, so
+// self-talk comes from TS's talk-status callback instead. The game uses it
+// to light the native talking indicators for the local player.
+static std::atomic<bool> s_selfTalking{false};
+
+// Snapshot of who is audible right now (including ourselves). Shared by the
+// UDP reverse channel (RoN) and the HTTP bridge response (Arma Reforger).
 static RtrTalkMsg buildTalkMsg(uint64_t now)
 {
     RtrTalkMsg msg{};
@@ -237,6 +242,14 @@ static RtrTalkMsg buildTalkMsg(uint64_t now)
         RtrTalkSpeaker& sp = msg.speakers[msg.count++];
         std::snprintf(sp.name, RTR_NAME_LEN, "%s", name.c_str());
         sp.amplitude = rc.amp;
+    }
+    if (s_selfTalking.load() && msg.count < RTR_TALK_MAX) {
+        const RtrSharedState st = s_link.snapshot();
+        if (st.localName[0] != '\0') {
+            RtrTalkSpeaker& sp = msg.speakers[msg.count++];
+            std::snprintf(sp.name, RTR_NAME_LEN, "%s", st.localName);
+            sp.amplitude = 0.8f; // no self RMS available; fixed level is fine
+        }
     }
     return msg;
 }
@@ -478,6 +491,16 @@ RTR_EXPORT void ts3plugin_registerPluginID(const char* id)
     const size_t sz = strlen(id) + 1;
     s_pluginID = (char*)malloc(sz);
     memcpy(s_pluginID, id, sz);
+}
+
+// Own-mic talk state (remote voices go through the audio callback instead).
+RTR_EXPORT void ts3plugin_onTalkStatusChangeEvent(uint64 sch, int status,
+                                                  int /*isReceivedWhisper*/, anyID clientID)
+{
+    anyID myID = 0;
+    if (ts3Functions.getClientID(sch, &myID) != ERROR_ok) return;
+    if (clientID == myID)
+        s_selfTalking = (status == STATUS_TALKING);
 }
 
 // Track which server connection is active.

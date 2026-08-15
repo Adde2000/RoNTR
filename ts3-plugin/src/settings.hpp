@@ -20,7 +20,7 @@ namespace rtr {
 
 struct Settings {
     // Proximity voice
-    float proxMaxDistM = 40.0f;  // inaudible beyond this many meters
+    float proxMaxDistM = 20.0f;  // inaudible beyond this many meters
     float proxRolloff  = 1.5f;   // falloff curve exponent
     float proxMaxPan   = 0.85f;  // cap so the far ear is never fully silent
     float proxSmooth   = 0.002f; // per-sample gain/pan slew (zipper guard)
@@ -32,7 +32,7 @@ struct Settings {
     float occlSlewMs      = 150.0f;   // fade time for occlusion changes
     // Radio effect
     float radioDrive = 4.0f;  // distortion drive
-    float radioNoise = 0.02f; // static noise level
+    float radioNoise = 0.005f; // static noise level
     // Diagnostics
     float debugLog = 0.0f;    // 1 = dump received game state to the TS log
 };
