@@ -58,6 +58,12 @@ to avoid doubled audio.
     - Restart TeamSpeak
     - In TeamSpeak, go to `Tools → Options → Addons` and verify that RoN Tactical Radio is installed, enabled and with the expected version
 
+## Plugin configuration
+
+The TeamSpeak plugin can be configured using commands (Windows & Linux) or using the addon settings menu (Windows only for now). 
+
+Run `/rtr show` in TeamSpeak to get a list of configurable options and their current values, run `/rtr set <key> <value>` to change a value. <br>This will be temporary and reset back to default when reloading the addon or restarting TS, unless you also run `/rtr save` to write the changes to file. 
+
 ## Build & deploy (automated)
 
 Prerequisites (one-time installs): 
