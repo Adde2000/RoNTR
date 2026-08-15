@@ -8,6 +8,7 @@
 // Staleness uses the RECEIVER's clock (last successful update), because the
 // game's clock domain (Wine) may not match a native client's.
 #pragma once
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -56,6 +57,7 @@ struct SpeakerAudio {
     bool  found  = false;   // speaker matched to a game player
     float distM  = 0.0f;
     float pan    = 0.0f;    // -1 left .. +1 right
+    float occlusion01 = 0.0f; // 0 = clear line of sight .. 1 = fully occluded
 };
 
 class GameLink {
@@ -107,6 +109,14 @@ public:
         m_state = s;
     }
 
+    // External transports (e.g. the HTTP bridge) push state here; marks the
+    // link fresh so poll()'s staleness logic treats it like shm/UDP data.
+    void injectState(const RtrSharedState& s, uint64_t nowMs)
+    {
+        setState(s);
+        m_lastGoodMs = nowMs;
+    }
+
     RtrSharedState snapshot() const
     {
         std::lock_guard<std::mutex> lk(m_mtx);
@@ -130,6 +140,7 @@ public:
             const Vec3 up    = {s.listenerUp.x,  s.listenerUp.y,  s.listenerUp.z};
             const Vec3 right = norm(cross(up, fwd)); // UE left-handed: up x fwd = right
             out.pan = out.distM > 0.5f ? dot(norm(to), right) : 0.0f;
+            out.occlusion01 = s.players[i].occlusion / 255.0f;
             return out;
         }
         return out;
@@ -226,7 +237,8 @@ private:
 
     mutable std::mutex m_mtx;
     RtrSharedState m_state{};
-    uint64_t m_lastGoodMs = 0;
+    // atomic: written by the poll thread AND injectState (HTTP bridge thread)
+    std::atomic<uint64_t> m_lastGoodMs{0};
     SOCKET m_sock = INVALID_SOCKET;
 #ifdef _WIN32
     HANDLE m_mapping{};

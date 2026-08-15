@@ -84,6 +84,61 @@ private:
     Biquad bp1, bp2;
 };
 
+// --- Occlusion: one-pole lowpass + attenuation, slewed ----------------------
+// Voice through walls sounds muffled and quieter; occlusion o in [0,1] comes
+// from the game mod's wall count (RtrPlayer::occlusion / 255).
+
+// One-pole lowpass: cheap and click-free while the cutoff moves. Default
+// coefficient of 1 passes input through unchanged (the o=0 state).
+class OnePoleLP {
+public:
+    void setCutoff(float sampleRate, float cutoffHz)
+    {
+        a = 1.0f - std::exp(-2.0f * 3.14159265f * cutoffHz / sampleRate);
+    }
+    float process(float x) { y += a * (x - y); return y; }
+private:
+    float a = 1.0f;
+    float y = 0.0f;
+};
+
+struct OcclusionParams {
+    float bypassHz      = 18000.0f; // o=0 cutoff (transparent for voice)
+    float minCutoffHz   = 500.0f;   // o=1 cutoff (fully muffled)
+    float maxAtten      = 0.55f;    // gain *= 1 - maxAtten*o on top of distance
+    // Occlusion changes slowly (~150 ms full swing) so strafing past a corner
+    // fades instead of popping. Deliberately much slower than PanState's slew.
+    float slewPerSample = 1.0f / (0.150f * 48000.0f);
+};
+
+// Cutoff for occlusion o: log interpolation bypass -> minCutoff.
+inline float occlusionCutoffHz(float o, const OcclusionParams& p = {})
+{
+    return std::exp(std::log(p.bypassHz) +
+                    (std::log(p.minCutoffHz) - std::log(p.bypassHz)) * o);
+}
+
+// Per-stream state: caller passes the SAME struct across frames.
+struct OcclusionState {
+    OnePoleLP lp;
+    float o = 0.0f; // slewed occlusion actually applied
+};
+
+// mono float buffer in [-1,1], processed in place.
+inline void applyOcclusion(float* mono, int count, float targetO,
+                           OcclusionState& st, float sampleRate = 48000.0f,
+                           const OcclusionParams& p = {})
+{
+    targetO = std::clamp(targetO, 0.0f, 1.0f);
+    for (int i = 0; i < count; ++i) {
+        const float prev = st.o;
+        st.o += std::clamp(targetO - st.o, -p.slewPerSample, p.slewPerSample);
+        if (st.o != prev) // steady state skips the exp/log work
+            st.lp.setCutoff(sampleRate, occlusionCutoffHz(st.o, p));
+        mono[i] = st.lp.process(mono[i]) * (1.0f - p.maxAtten * st.o);
+    }
+}
+
 // --- Proximity: distance gain + constant-power stereo pan -------------------
 struct ProximityParams {
     float maxDistM = 40.0f;
