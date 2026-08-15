@@ -29,7 +29,9 @@
 #include "plugin_definitions.h"
 
 #include "gamelink.hpp"
+#ifdef RTR_HTTP_BRIDGE
 #include "httpbridge.hpp"
+#endif
 #include "radio_dsp.hpp"
 #include "settings.hpp"
 #include "config_win.hpp"
@@ -46,7 +48,9 @@ static struct TS3Functions ts3Functions;
 
 static char* s_pluginID = nullptr;
 static rtr::GameLink s_link;
+#ifdef RTR_HTTP_BRIDGE
 static rtr::HttpBridge s_http; // Arma Reforger transport (RestApi loopback)
+#endif
 static std::thread s_pollThread;
 static std::atomic<bool> s_running{false};
 
@@ -322,6 +326,17 @@ static void pollLoop()
         publishTalkers(nowMs());
         if (ok) maybeLogState(st); // debug.log dumps for shm/UDP games too
 
+        // The version gate rejects mismatched game mods SILENTLY by design
+        // (clean passthrough) — but say so, or it looks like a dead plugin.
+        static uint64_t lastVerWarnMs = 0;
+        const uint32_t peerVer = s_link.mismatchedPeerVersion();
+        if (peerVer != 0 && nowMs() - lastVerWarnMs > 10000) {
+            lastVerWarnMs = nowMs();
+            tsLog("game mod speaks protocol v" + std::to_string(peerVer) +
+                  " but this plugin expects v" + std::to_string(RTR_VERSION) +
+                  " - update the game mod (mod and plugin ship as a pair)");
+        }
+
         if (!ok || !st.inGame) {
             if (micApplied != -1) { setMicOpen(true); micApplied = -1; } // restore normal TS
             if (sentHello) tsLog("game link inactive (loading screen or menu)");
@@ -408,7 +423,8 @@ RTR_EXPORT void ts3plugin_configure(void* /*handle*/, void* /*qParentWidget*/)
     rtrcfg::runDialog(std::move(host));
 #else
     const std::string cmd = "xdg-open '" + s_settingsPath + "' &";
-    (void)std::system(cmd.c_str());
+    if (std::system(cmd.c_str()) != 0)
+        tsLog("could not open settings file: " + s_settingsPath);
 #endif
 }
 
@@ -416,20 +432,33 @@ RTR_EXPORT int ts3plugin_init()
 {
     initSettings();
     const bool shm = s_link.open(); // ok to fail now; poll() retries via snapshot staleness
+    std::string httpNote = ", http bridge disabled (build option)";
+#ifdef RTR_HTTP_BRIDGE
     s_http.setLogger([](const std::string& msg) { tsLog(msg); });
     s_http.setPluginVersion(PLUGIN_VERSION);
     const bool http = s_http.start(RTR_HTTP_PORT,
         [](const RtrSharedState& st) {
-            s_link.injectState(st, nowMs());
+            if (!s_link.injectState(st, nowMs())) {
+                static uint64_t lastIgnoreLogMs = 0; // bridge thread only
+                const uint64_t now = nowMs();
+                if (now - lastIgnoreLogMs > 10000) {
+                    lastIgnoreLogMs = now;
+                    tsLog("http state ignored: a native game link (shm/UDP) is active");
+                }
+                return;
+            }
             maybeLogState(st);
         },
         [] { return buildTalkMsg(nowMs()); });
+    httpNote = http ? ", http bridge on 127.0.0.1:" + std::to_string(RTR_HTTP_PORT)
+                    : ", http bridge FAILED (port in use?)";
+#endif
     s_running = true;
     s_pollThread = std::thread(pollLoop);
     tsLog(std::string("plugin loaded, shared memory ") +
-          (shm ? "found (game already running)" : "not present yet (start RoN with the mod)") +
-          (http ? ", http bridge on 127.0.0.1:" + std::to_string(RTR_HTTP_PORT)
-                : ", http bridge FAILED (port in use?)"));
+          (shm ? "mapping present (game running, or another process still holds it)"
+               : "not present yet (start RoN with the mod)") +
+          httpNote);
     return 0;
 }
 
@@ -437,7 +466,9 @@ RTR_EXPORT void ts3plugin_shutdown()
 {
     s_running = false;
     if (s_pollThread.joinable()) s_pollThread.join();
+#ifdef RTR_HTTP_BRIDGE
     s_http.stop();
+#endif
     s_link.close();
     if (s_pluginID) { free(s_pluginID); s_pluginID = nullptr; }
 }

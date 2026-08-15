@@ -88,14 +88,30 @@ public:
     {
         bool updated = false;
 #ifdef _WIN32
-        if (!m_view) openShm();          // game may start after TS
+        if (!m_view && nowMs >= m_shmRetryAtMs) openShm(); // game may start after TS
         if (m_view) updated = pollShm();
 #endif
         if (m_sock == INVALID_SOCKET) openUdp();
         if (pollUdp()) updated = true;
 
-        if (updated) m_lastGoodMs = nowMs;
+        if (updated) { m_lastGoodMs = nowMs; noteNativeUpdate(nowMs); }
         if (m_lastGoodMs == 0 || nowMs - m_lastGoodMs > 1000) {
+#ifdef _WIN32
+            // Release the mapping while the link is dead: a named mapping
+            // stays alive while ANY process holds a handle, so keeping ours
+            // open would preserve Local\RoNTacticalRadio after the game
+            // exits (confusing every "is the game running?" check, ours
+            // included). Reopen attempts are throttled to 1 Hz; the UDP
+            // mirror still detects a restarted game within one poll.
+            if (m_view) {
+                UnmapViewOfFile(m_view);
+                m_view = nullptr;
+                CloseHandle(m_mapping);
+                m_mapping = nullptr;
+                m_lastShmSeq = 0;
+            }
+            if (m_shmRetryAtMs < nowMs) m_shmRetryAtMs = nowMs + 1000;
+#endif
             setState({});                // stale -> behave as not-in-game
             return false;
         }
@@ -111,11 +127,25 @@ public:
 
     // External transports (e.g. the HTTP bridge) push state here; marks the
     // link fresh so poll()'s staleness logic treats it like shm/UDP data.
-    void injectState(const RtrSharedState& s, uint64_t nowMs)
+    // Returns false when ignored: native transports (shm/UDP) own the link
+    // while they are fresh, so a second game left running in the background
+    // (posting ingame=0 over HTTP) cannot stomp an active session. HTTP
+    // takes over once the native link has been stale for >1s.
+    bool injectState(const RtrSharedState& s, uint64_t nowMs)
     {
+        const uint64_t native = m_lastNativeMs.load();
+        if (native != 0 && nowMs - native < 1000) return false;
         setState(s);
         m_lastGoodMs = nowMs;
+        return true;
     }
+
+    // poll() records native freshness here; public so tests can simulate it.
+    void noteNativeUpdate(uint64_t nowMs) { m_lastNativeMs = nowMs; }
+
+    // Nonzero when data with our magic but a DIFFERENT protocol version was
+    // seen (game mod and plugin out of step). For diagnostics only.
+    uint32_t mismatchedPeerVersion() const { return m_peerVersion.load(); }
 
     RtrSharedState snapshot() const
     {
@@ -198,6 +228,8 @@ private:
                                       0, nullptr, nullptr);
             if (n <= 0 || static_cast<size_t>(n) != sizeof(tmp)) break;
             if (valid(tmp)) { pkt = tmp; got = true; }
+            else if (tmp.magic == RTR_MAGIC && tmp.version != RTR_VERSION)
+                m_peerVersion = tmp.version; // right game, wrong protocol
         }
         if (got) setState(pkt);
         return got;
@@ -225,7 +257,11 @@ private:
             std::memcpy(&local, (const void*)m_view, sizeof(local));
             const uint32_t s2 = m_view->sequence;
             if (s1 != s2) continue;
-            if (!valid(local)) return false;
+            if (!valid(local)) {
+                if (local.magic == RTR_MAGIC && local.version != RTR_VERSION)
+                    m_peerVersion = local.version; // right game, wrong protocol
+                return false;
+            }
             if (s2 == m_lastShmSeq) return false; // writer stalled -> not fresh
             m_lastShmSeq = s2;
             setState(local);
@@ -239,11 +275,14 @@ private:
     RtrSharedState m_state{};
     // atomic: written by the poll thread AND injectState (HTTP bridge thread)
     std::atomic<uint64_t> m_lastGoodMs{0};
+    std::atomic<uint64_t> m_lastNativeMs{0}; // last fresh shm/UDP update
+    std::atomic<uint32_t> m_peerVersion{0};  // last mismatched protocol seen
     SOCKET m_sock = INVALID_SOCKET;
 #ifdef _WIN32
     HANDLE m_mapping{};
     const RtrSharedState* m_view{};
     uint32_t m_lastShmSeq = 0;
+    uint64_t m_shmRetryAtMs = 0; // poll thread only
 #endif
 };
 

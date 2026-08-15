@@ -202,6 +202,30 @@ static void testHttpStateParse()
     CHECK(rtr::parseStateText("rtr=3\nplayer=NoCoords\n", bad) == rtr::ParseResult::Malformed);
 }
 
+static void testTransportArbitration()
+{
+    rtr::GameLink link;
+    RtrSharedState native{};
+    native.magic = RTR_MAGIC; native.version = RTR_VERSION;
+    native.inGame = 1;
+    std::strcpy(native.players[0].name, "ron-player");
+    native.playerCount = 1;
+
+    RtrSharedState http{};
+    http.magic = RTR_MAGIC; http.version = RTR_VERSION;
+    http.inGame = 0; // background game in menus
+
+    // Native link fresh -> HTTP injection is refused, state untouched.
+    link.setState(native);
+    link.noteNativeUpdate(10000);
+    CHECK(!link.injectState(http, 10500));
+    CHECK(link.snapshot().inGame == 1);
+
+    // Native stale (>1s) -> HTTP takes over.
+    CHECK(link.injectState(http, 11500));
+    CHECK(link.snapshot().inGame == 0);
+}
+
 static void testHttpMultiRadioAndGameId()
 {
     RtrSharedState st{};
@@ -357,6 +381,7 @@ int main()
     testOcclusionQuery();
     testOcclusionSlewAndAtten();
     testHttpStateParse();
+    testTransportArbitration();
     testHttpMultiRadioAndGameId();
     testHttpBodyNormalization();
     testTalkText();

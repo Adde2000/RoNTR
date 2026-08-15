@@ -73,6 +73,13 @@ the link as dead after 1 s without a valid POST and reverts to plain TS
 audio, so a crashed game degrades gracefully. Don't batch: each POST should
 be the current snapshot.
 
+**Transport arbitration:** the native transports (shared memory / UDP, used
+by RoN) own the game link while they deliver fresh data; HTTP state is
+ignored during that time (the POST still gets a 200 + talk response, and the
+TS log notes it, throttled). HTTP takes over automatically once the native
+link has been stale for >1 s. Practically: a game left idling in the
+background can never stomp the game actually being played.
+
 **Frequencies match by exact integer equality** — transmitter and listeners
 hear each other only when tuned to the same kHz value. Integrations should
 step frequencies on a fixed grid so equality is reachable.

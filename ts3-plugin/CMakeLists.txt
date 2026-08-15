@@ -8,7 +8,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(TS3_PLUGINSDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ts3client-pluginsdk"
     CACHE PATH "TeamSpeak 3 Client Plugin SDK checkout")
 
+# Localhost HTTP state bridge (Arma Reforger integration). OFF ships a plugin
+# with no listener at all; ON defines RTR_HTTP_BRIDGE for plugin.cpp.
+option(RTR_HTTP_BRIDGE "Enable the localhost HTTP state bridge" OFF)
+
 add_library(ron_tactical_radio SHARED src/plugin.cpp)
+if(RTR_HTTP_BRIDGE)
+    target_compile_definitions(ron_tactical_radio PRIVATE RTR_HTTP_BRIDGE=1)
+endif()
 
 target_include_directories(ron_tactical_radio PRIVATE
     "${TS3_PLUGINSDK_DIR}/include"
