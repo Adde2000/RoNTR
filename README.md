@@ -66,7 +66,11 @@ cmake -B build -DRTR_BUILD_TESTS=ON && cmake --build build && ./build/rtr_tests
 - **M3:** radio UX — freq config ini, channel cycle feedback, squelch clicks.
 - **M4:** occlusion, dual-path (radio + direct) mixing, installer packaging.
 
-## Keys (defaults, in `dllmain.cpp`)
+## Configuration
 
-- Caps Lock — radio PTT (local voice is always on, no key needed)
-- ] — cycle radio channel
+Keybinds, radio frequencies, and update rate live in
+`ue4ss\Mods\RoNTacticalRadio\config.ini` — auto-created with defaults on
+first launch (template: `game-mod/config.example.ini`). Defaults:
+Caps Lock = radio PTT, `]` = cycle channel, freqs 246000/247000 kHz.
+Local voice is always on — no key needed. Edit the ini and restart the game
+to apply.
