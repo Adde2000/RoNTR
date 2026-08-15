@@ -320,6 +320,7 @@ static void pollLoop()
         const bool ok = s_link.poll(nowMs());
         const RtrSharedState st = s_link.snapshot();
         publishTalkers(nowMs());
+        if (ok) maybeLogState(st); // debug.log dumps for shm/UDP games too
 
         if (!ok || !st.inGame) {
             if (micApplied != -1) { setMicOpen(true); micApplied = -1; } // restore normal TS
