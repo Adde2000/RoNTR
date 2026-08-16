@@ -47,7 +47,7 @@ jobs:
   # which requires the UEPSEUDO_TOKEN secret from an Epic-linked GitHub
   # account - see docs/RELEASING.md. Runs only when the secret is configured.
   game-mod:
-    runs-on: windows-latest
+    runs-on: self-hosted
     env:
       UEPSEUDO_TOKEN: ${{ secrets.UEPSEUDO_TOKEN }}
     steps:

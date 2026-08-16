@@ -28,12 +28,50 @@ Note: vanilla RoN has a built-in proximity VOIP (`UProximityVoiceComponent`,
 `EVoiceType{VT_Local,VT_Team}`) — disable in-game voice while using this mod
 to avoid doubled audio.
 
+## Installation instructions (WIP)
+
+### Windows
+
+1. Download the mod and TeamSpeak 3 plugin (links are WIP)
+
+2. Install game mod
+    - Copy the `ue4ss` folder and `dwmapi.dll` file to `/Steam/steamapps/common/Ready Or Not/ReadyOrNot/Binaries/Win64/`
+
+3. Install TeamSpeak plugin
+    - Copy the `ron_tactical_radio.dll` file to `C:\Users\user\AppData\Roaming\TS3Client\plugins`
+    - Restart TeamSpeak
+    - In TeamSpeak, go to `Tools → Options → Addons` and verify that RoN Tactical Radio is installed, enabled and with the expected version
+
+### Linux (Tested with Proton 11.0)
+
+1. Download the mod and TeamSpeak 3 plugin (links are WIP)
+
+2. Install game mod
+    - Copy the `ue4ss` folder and `dwmapi.dll` file to `/Steam/steamapps/common/Ready Or Not/ReadyOrNot/Binaries/Win64/`
+    - In Steam: Ready or Not → Properties → Launch Options:
+        ```
+        WINEDLLOVERRIDES="dwmapi=n,b" %command%
+        ```
+
+3. Install TeamSpeak plugin
+    - Copy the `ron_tactical_radio_linux_amd64.so` file to `/home/user/.var/app/com.teamspeak.TeamSpeak3/.ts3client/plugins/`
+    - Restart TeamSpeak
+    - In TeamSpeak, go to `Tools → Options → Addons` and verify that RoN Tactical Radio is installed, enabled and with the expected version
+
+## Plugin configuration
+
+The TeamSpeak plugin can be configured using commands (Windows & Linux) or using the addon settings menu (Windows only for now). 
+
+Run `/rtr show` in TeamSpeak to get a list of configurable options and their current values, run `/rtr set <key> <value>` to change a value. <br>This will be temporary and reset back to default when reloading the addon or restarting TS, unless you also run `/rtr save` to write the changes to file. 
+
 ## Build & deploy (automated)
 
-Prerequisites (one-time installs): Git, CMake 3.22+, Visual Studio 2022 with
-the Desktop C++ workload, Rust via [rustup.rs](https://rustup.rs) (RE-UE4SS
-dependency), and a GitHub account linked to Epic Games (RE-UE4SS's Unreal
-submodule — see [docs.ue4ss.com](https://docs.ue4ss.com/guides/creating-a-c++-mod.html)).
+Prerequisites (one-time installs): 
+* Git
+* CMake 3.22+
+* Visual Studio 2022+ with the Desktop C++ workload
+* Rust via [rustup.rs](https://rustup.rs) (RE-UE4SSdependency)
+* A GitHub account linked to Epic Games (RE-UE4SS's Unrealsubmodule — see [docs.ue4ss.com](https://docs.ue4ss.com/guides/creating-a-c++-mod.html)).
 
 Then, in PowerShell:
 
@@ -65,9 +103,15 @@ Milestones can be found here: [Milestones](https://github.com/Adde2000/RoNTR/mil
 
 ## Configuration
 
+- Caps Lock — radio PTT (local voice is always on, no key needed)
+- ] — cycle radio channel
+
 Keybinds, radio frequencies, and update rate live in
 `ue4ss\Mods\RoNTacticalRadio\config.ini` — auto-created with defaults on
 first launch (template: `game-mod/config.example.ini`). Defaults:
 Caps Lock = radio PTT, `]` = cycle channel, freqs 246000/247000 kHz.
 Local voice is always on — no key needed. Edit the ini and restart the game
 to apply.
+
+
+![I make Ready or Not mods.](https://lynxgaming.net/wp-content/uploads/2026/08/image-240x300.png)
