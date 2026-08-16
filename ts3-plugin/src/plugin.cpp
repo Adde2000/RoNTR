@@ -6,7 +6,7 @@
 //   https://github.com/teamspeak/ts3client-pluginsdk
 // Install: %APPDATA%/TS3Client/plugins/ron_tactical_radio.dll
 
-#define PLUGIN_VERSION "0.4.3" // keep in step with game-mod ModVersion / release tag
+#define PLUGIN_VERSION "0.5.0" // keep in step with game-mod ModVersion / release tag
 #define PLUGIN_NAME "RoN Tactical Radio"
 #define PLUGIN_API_VERSION 26
 
@@ -29,7 +29,14 @@
 #include "plugin_definitions.h"
 
 #include "gamelink.hpp"
+#ifdef RTR_HTTP_BRIDGE
+#include "httpbridge.hpp"
+#endif
 #include "radio_dsp.hpp"
+#include "settings.hpp"
+#include "config_win.hpp"
+
+#include <filesystem>
 
 static struct TS3Functions ts3Functions;
 
@@ -41,6 +48,9 @@ static struct TS3Functions ts3Functions;
 
 static char* s_pluginID = nullptr;
 static rtr::GameLink s_link;
+#ifdef RTR_HTTP_BRIDGE
+static rtr::HttpBridge s_http; // Arma Reforger transport (RestApi loopback)
+#endif
 static std::thread s_pollThread;
 static std::atomic<bool> s_running{false};
 
@@ -51,6 +61,7 @@ struct RemoteClient {
     uint32_t    txFreqKhz = 0; // nonzero while transmitting on radio
     rtr::RadioEffect radio;
     rtr::PanState pan;
+    rtr::OcclusionState occl;  // wall muffling (proximity path only)
     uint64_t    lastAudioLogMs = 0; // throttled diagnostics
     float       amp = 0.0f;         // smoothed loudness 0..1 (drives mouth anim)
     uint64_t    lastAudioMs = 0;    // last time we processed audio from them
@@ -58,6 +69,13 @@ struct RemoteClient {
 static std::mutex s_mtx;
 static std::map<anyID, RemoteClient> s_clients;
 static uint64 s_sch = 0; // active server connection
+
+// Live-tunable DSP settings (settings.hpp). Guarded by s_mtx: the audio
+// callback copies them under its existing lock, the poll thread hot-reloads
+// the ini (~1s), and /rtr chat commands set values from the UI thread.
+static rtr::Settings s_settings;
+static std::string s_settingsPath;                     // <TS config>/ron_tactical_radio.ini
+static std::filesystem::file_time_type s_settingsMtime;
 
 static uint64_t nowMs()
 {
@@ -90,6 +108,101 @@ static void sendCmd(const std::string& cmd)
                                    PluginCommandTarget_CURRENT_CHANNEL, nullptr, nullptr);
 }
 
+// ------------------------------------------------------- tunable settings ---
+
+// Load (or create) the settings ini in the TS config directory.
+static void initSettings()
+{
+    char cfgDir[512]{};
+    ts3Functions.getConfigPath(cfgDir, sizeof(cfgDir));
+    std::string dir = cfgDir;
+    if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') dir += '/';
+    s_settingsPath = dir + "ron_tactical_radio.ini";
+
+    rtr::Settings loaded;
+    if (rtr::settingsLoad(loaded, s_settingsPath)) {
+        tsLog("settings loaded from " + s_settingsPath);
+    } else {
+        rtr::settingsSave(loaded, s_settingsPath); // write commented defaults
+        tsLog("settings file created: " + s_settingsPath);
+    }
+    std::error_code ec;
+    s_settingsMtime = std::filesystem::last_write_time(s_settingsPath, ec);
+    std::lock_guard<std::mutex> lk(s_mtx);
+    s_settings = loaded;
+}
+
+// Diagnostics (debug.log setting): dump the received game state every ~2s so
+// transmitted positions can be checked against the game's own logs. Runs on
+// the HTTP bridge thread (single-threaded, so the plain statics are fine).
+static void maybeLogState(const RtrSharedState& st)
+{
+    {
+        std::lock_guard<std::mutex> lk(s_mtx);
+        if (s_settings.debugLog < 0.5f) return;
+    }
+    static uint64_t lastMs = 0;
+    const uint64_t now = nowMs();
+    if (now - lastMs < 2000) return;
+    lastMs = now;
+
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "state: ingame=%d me='%s' lpos=(%.1f,%.1f,%.1f) fwd=(%.2f,%.2f,%.2f) players=%u",
+                  int(st.inGame), st.localName,
+                  st.listenerPos.x, st.listenerPos.y, st.listenerPos.z,
+                  st.listenerFwd.x, st.listenerFwd.y, st.listenerFwd.z,
+                  st.playerCount);
+    tsLog(buf);
+    for (uint32_t i = 0; i < st.playerCount && i < RTR_MAX_PLAYERS; ++i) {
+        const RtrPlayer& p = st.players[i];
+        const float dx = p.pos.x - st.listenerPos.x;
+        const float dy = p.pos.y - st.listenerPos.y;
+        const float dz = p.pos.z - st.listenerPos.z;
+        std::snprintf(buf, sizeof(buf),
+                      "  '%s' pos=(%.1f,%.1f,%.1f) dist=%.1fm alive=%d occl=%d",
+                      p.name, p.pos.x, p.pos.y, p.pos.z,
+                      std::sqrt(dx * dx + dy * dy + dz * dz),
+                      int(p.alive), int(p.occlusion));
+        tsLog(buf);
+    }
+}
+
+// Persist current settings; refreshes the stored mtime so the hot reload
+// doesn't re-trigger on our own write.
+static bool saveSettingsToFile()
+{
+    rtr::Settings copy;
+    { std::lock_guard<std::mutex> lk(s_mtx); copy = s_settings; }
+    const bool ok = rtr::settingsSave(copy, s_settingsPath);
+    std::error_code ec;
+    const auto mtime = std::filesystem::last_write_time(s_settingsPath, ec);
+    { std::lock_guard<std::mutex> lk(s_mtx); s_settingsMtime = mtime; }
+    return ok;
+}
+
+// Poll-thread: re-read the ini when its timestamp changes (edit + save while
+// playing = new values within ~1s).
+static void reloadSettingsIfChanged()
+{
+    if (s_settingsPath.empty()) return;
+    std::error_code ec;
+    const auto mtime = std::filesystem::last_write_time(s_settingsPath, ec);
+    if (ec) return;
+    {
+        std::lock_guard<std::mutex> lk(s_mtx);
+        if (mtime == s_settingsMtime) return;
+        s_settingsMtime = mtime;
+    }
+    rtr::Settings loaded; // defaults + file so removed keys fall back cleanly
+    if (!rtr::settingsLoad(loaded, s_settingsPath)) return;
+    {
+        std::lock_guard<std::mutex> lk(s_mtx);
+        s_settings = loaded;
+    }
+    tsLog("settings reloaded from " + s_settingsPath);
+}
+
 // Reverse channel: tell the game mod who is audible and how loud, so it can
 // drive character mouth animation (VoipMouthAlpha) in sync with TS speech.
 static SOCKET s_talkSock = INVALID_SOCKET;
@@ -108,8 +221,14 @@ static void sendTalkMsg(const RtrTalkMsg& msg)
              reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
 }
 
-// Called from the poll thread every 50ms.
-static void publishTalkers(uint64_t now)
+// Our own mic: onEditPostProcessVoiceDataEvent only sees REMOTE voices, so
+// self-talk comes from TS's talk-status callback instead. The game uses it
+// to light the native talking indicators for the local player.
+static std::atomic<bool> s_selfTalking{false};
+
+// Snapshot of who is audible right now (including ourselves). Shared by the
+// UDP reverse channel (RoN) and the HTTP bridge response (Arma Reforger).
+static RtrTalkMsg buildTalkMsg(uint64_t now)
 {
     RtrTalkMsg msg{};
     msg.magic = RTR_MAGIC;
@@ -117,14 +236,34 @@ static void publishTalkers(uint64_t now)
     std::lock_guard<std::mutex> lk(s_mtx);
     for (auto& [id, rc] : s_clients) {
         if (msg.count >= RTR_TALK_MAX) break;
-        if (now - rc.lastAudioMs > 250) { rc.amp *= 0.8f; continue; } // fading out
+        if (now - rc.lastAudioMs > 250) continue; // fading out
         const std::string& name = !rc.gameName.empty() ? rc.gameName : rc.nickname;
         if (name.empty()) continue;
         RtrTalkSpeaker& sp = msg.speakers[msg.count++];
         std::snprintf(sp.name, RTR_NAME_LEN, "%s", name.c_str());
         sp.amplitude = rc.amp;
     }
-    sendTalkMsg(msg); // sent even when empty so mouths close promptly
+    if (s_selfTalking.load() && msg.count < RTR_TALK_MAX) {
+        const RtrSharedState st = s_link.snapshot();
+        if (st.localName[0] != '\0') {
+            RtrTalkSpeaker& sp = msg.speakers[msg.count++];
+            std::snprintf(sp.name, RTR_NAME_LEN, "%s", st.localName);
+            sp.amplitude = 0.8f; // no self RMS available; fixed level is fine
+        }
+    }
+    return msg;
+}
+
+// Called from the poll thread every 50ms. Owns the fade-out decay so the
+// HTTP thread's buildTalkMsg calls don't double the decay rate.
+static void publishTalkers(uint64_t now)
+{
+    {
+        std::lock_guard<std::mutex> lk(s_mtx);
+        for (auto& [id, rc] : s_clients)
+            if (now - rc.lastAudioMs > 250) rc.amp *= 0.8f;
+    }
+    sendTalkMsg(buildTalkMsg(now)); // sent even when empty so mouths close promptly
 }
 
 // Rename own TS nickname to the in-game name while playing (makes matching
@@ -172,8 +311,11 @@ static void pollLoop()
     int micApplied = -1; // -1 = TS default (not gated), 0 = closed, 1 = open
     uint64_t lastActiveMs = 0; // last time the game link was active
 
+    int cfgTick = 0;
     while (s_running.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        if (++cfgTick >= 20) { cfgTick = 0; reloadSettingsIfChanged(); }
 
         // The plugin may load AFTER TS connected to a server, in which case no
         // connect event fires - resolve the active connection lazily.
@@ -195,6 +337,18 @@ static void pollLoop()
         const bool ok = s_link.poll(nowMs());
         const RtrSharedState st = s_link.snapshot();
         publishTalkers(nowMs());
+        if (ok) maybeLogState(st); // debug.log dumps for shm/UDP games too
+
+        // The version gate rejects mismatched game mods SILENTLY by design
+        // (clean passthrough) — but say so, or it looks like a dead plugin.
+        static uint64_t lastVerWarnMs = 0;
+        const uint32_t peerVer = s_link.mismatchedPeerVersion();
+        if (peerVer != 0 && nowMs() - lastVerWarnMs > 10000) {
+            lastVerWarnMs = nowMs();
+            tsLog("game mod speaks protocol v" + std::to_string(peerVer) +
+                  " but this plugin expects v" + std::to_string(RTR_VERSION) +
+                  " - update the game mod (mod and plugin ship as a pair)");
+        }
 
         if (!ok || !st.inGame) {
             if (micApplied != -1) { setMicOpen(true); micApplied = -1; } // restore normal TS
@@ -259,13 +413,65 @@ RTR_EXPORT void ts3plugin_setFunctionPointers(const struct TS3Functions funcs)
     ts3Functions = funcs;
 }
 
+// "Settings" button in TeamSpeak's Plugins dialog. On Windows this opens a
+// native slider window (config_win.hpp) whose changes apply live; elsewhere
+// it opens the ini in the default editor (hot-reloaded ~1s by the poll
+// thread). The /rtr chat command remains available on all platforms.
+RTR_EXPORT int ts3plugin_offersConfigure() { return PLUGIN_OFFERS_CONFIGURE_NEW_THREAD; }
+
+RTR_EXPORT void ts3plugin_configure(void* /*handle*/, void* /*qParentWidget*/)
+{
+#ifdef _WIN32
+    rtrcfg::Host host;
+    host.get = [] {
+        std::lock_guard<std::mutex> lk(s_mtx);
+        return s_settings;
+    };
+    host.set = [](const rtr::Settings& s) {
+        std::lock_guard<std::mutex> lk(s_mtx);
+        s_settings = s;
+    };
+    host.save = [] { return saveSettingsToFile(); };
+    host.iniPath = s_settingsPath;
+    rtrcfg::runDialog(std::move(host));
+#else
+    const std::string cmd = "xdg-open '" + s_settingsPath + "' &";
+    if (std::system(cmd.c_str()) != 0)
+        tsLog("could not open settings file: " + s_settingsPath);
+#endif
+}
+
 RTR_EXPORT int ts3plugin_init()
 {
+    initSettings();
     const bool shm = s_link.open(); // ok to fail now; poll() retries via snapshot staleness
+    std::string httpNote = ", http bridge disabled (build option)";
+#ifdef RTR_HTTP_BRIDGE
+    s_http.setLogger([](const std::string& msg) { tsLog(msg); });
+    s_http.setPluginVersion(PLUGIN_VERSION);
+    const bool http = s_http.start(RTR_HTTP_PORT,
+        [](const RtrSharedState& st) {
+            if (!s_link.injectState(st, nowMs())) {
+                static uint64_t lastIgnoreLogMs = 0; // bridge thread only
+                const uint64_t now = nowMs();
+                if (now - lastIgnoreLogMs > 10000) {
+                    lastIgnoreLogMs = now;
+                    tsLog("http state ignored: a native game link (shm/UDP) is active");
+                }
+                return;
+            }
+            maybeLogState(st);
+        },
+        [] { return buildTalkMsg(nowMs()); });
+    httpNote = http ? ", http bridge on 127.0.0.1:" + std::to_string(RTR_HTTP_PORT)
+                    : ", http bridge FAILED (port in use?)";
+#endif
     s_running = true;
     s_pollThread = std::thread(pollLoop);
     tsLog(std::string("plugin loaded, shared memory ") +
-          (shm ? "found (game already running)" : "not present yet (start RoN with the mod)"));
+          (shm ? "mapping present (game running, or another process still holds it)"
+               : "not present yet (start RoN with the mod)") +
+          httpNote);
     return 0;
 }
 
@@ -273,6 +479,9 @@ RTR_EXPORT void ts3plugin_shutdown()
 {
     s_running = false;
     if (s_pollThread.joinable()) s_pollThread.join();
+#ifdef RTR_HTTP_BRIDGE
+    s_http.stop();
+#endif
     s_link.close();
     if (s_pluginID) { free(s_pluginID); s_pluginID = nullptr; }
 }
@@ -284,11 +493,74 @@ RTR_EXPORT void ts3plugin_registerPluginID(const char* id)
     memcpy(s_pluginID, id, sz);
 }
 
+// Own-mic talk state (remote voices go through the audio callback instead).
+RTR_EXPORT void ts3plugin_onTalkStatusChangeEvent(uint64 sch, int status,
+                                                  int /*isReceivedWhisper*/, anyID clientID)
+{
+    anyID myID = 0;
+    if (ts3Functions.getClientID(sch, &myID) != ERROR_ok) return;
+    if (clientID == myID)
+        s_selfTalking = (status == STATUS_TALKING);
+}
+
 // Track which server connection is active.
 RTR_EXPORT void ts3plugin_onConnectStatusChangeEvent(uint64 sch, int newStatus, unsigned int /*err*/)
 {
     if (newStatus == STATUS_CONNECTION_ESTABLISHED) s_sch = sch;
     if (newStatus == STATUS_DISCONNECTED && s_sch == sch) s_sch = 0;
+}
+
+// ------------------------------------------------ live tuning chat command ---
+// /rtr show | /rtr set <key> <value> | /rtr save | /rtr reload | /rtr reset
+// Changes apply to the next audio frame; 'save' persists them to the ini.
+
+RTR_EXPORT const char* ts3plugin_commandKeyword() { return "rtr"; }
+
+RTR_EXPORT int ts3plugin_processCommand(uint64 /*sch*/, const char* command)
+{
+    const auto reply = [](const std::string& msg) {
+        ts3Functions.printMessageToCurrentTab(("[RoNTacticalRadio] " + msg).c_str());
+    };
+
+    std::istringstream in(command ? command : "");
+    std::string verb, key, val;
+    in >> verb >> key >> val;
+    verb = rtr::settingsLowerTrim(verb);
+
+    if (verb == "show" || verb.empty()) {
+        std::lock_guard<std::mutex> lk(s_mtx);
+        reply("settings (" + s_settingsPath + "):\n" + rtr::settingsDescribe(s_settings));
+    } else if (verb == "set" && !key.empty() && !val.empty()) {
+        char* end = nullptr;
+        const float f = std::strtof(val.c_str(), &end);
+        if (end == val.c_str()) { reply("not a number: '" + val + "'"); return 0; }
+        std::string err;
+        std::lock_guard<std::mutex> lk(s_mtx);
+        if (!rtr::settingsSet(s_settings, key, f, &err)) { reply(err); return 0; }
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "%s = %g (use '/rtr save' to keep)",
+                      rtr::settingsLowerTrim(key).c_str(), double(f));
+        reply(buf);
+    } else if (verb == "save") {
+        reply(saveSettingsToFile() ? "saved to " + s_settingsPath
+                                   : "save FAILED: " + s_settingsPath);
+    } else if (verb == "reload") {
+        rtr::Settings loaded;
+        if (rtr::settingsLoad(loaded, s_settingsPath)) {
+            std::lock_guard<std::mutex> lk(s_mtx);
+            s_settings = loaded;
+            reply("reloaded from " + s_settingsPath);
+        } else {
+            reply("reload FAILED: " + s_settingsPath);
+        }
+    } else if (verb == "reset") {
+        std::lock_guard<std::mutex> lk(s_mtx);
+        s_settings = rtr::Settings{};
+        reply("settings reset to defaults (in memory; '/rtr save' to persist)");
+    } else {
+        reply("usage: /rtr show | set <key> <value> | save | reload | reset");
+    }
+    return 0; // handled
 }
 
 // ------------------------------------------------------------ radio sync ---
@@ -326,6 +598,7 @@ RTR_EXPORT void ts3plugin_onEditPostProcessVoiceDataEvent(
     std::lock_guard<std::mutex> lk(s_mtx);
     RemoteClient& rc = s_clients[clientID];
     if (rc.nickname.empty()) rc.nickname = clientNickname(sch, clientID);
+    const rtr::Settings cfg = s_settings; // stable copy for this frame
 
     const RtrSharedState st = s_link.snapshot();
     if (!st.inGame) return; // menus/lobby: untouched TS audio
@@ -370,7 +643,7 @@ RTR_EXPORT void ts3plugin_onEditPostProcessVoiceDataEvent(
     float gain = 1.0f, pan = 0.0f;
     const uint64_t now = nowMs();
     if (radio) {
-        rc.radio.processMono(mono.data(), sampleCount);
+        rc.radio.processMono(mono.data(), sampleCount, cfg.radioDrive, cfg.radioNoise);
     } else {
         const std::string& matchName = !rc.gameName.empty() ? rc.gameName : rc.nickname;
         const rtr::SpeakerAudio q = s_link.query(matchName);
@@ -381,16 +654,24 @@ RTR_EXPORT void ts3plugin_onEditPostProcessVoiceDataEvent(
             }
             return; // unmodded player: normal TS audio
         }
-        gain = rtr::distanceGain(q.distM);
+        gain = rtr::distanceGain(q.distM, {cfg.proxMaxDistM, cfg.proxRolloff});
         // Cap pan so a speaker dead to one side is still faintly audible in
         // the far ear (real heads leak sound around; full pan feels unnatural).
-        constexpr float kMaxPan = 0.85f;
-        pan = std::clamp(q.pan, -kMaxPan, kMaxPan);
+        pan = std::clamp(q.pan, -cfg.proxMaxPan, cfg.proxMaxPan);
+        // Muffle through walls. Radio path skips this: radio exists to beat
+        // walls. Occlusion has its own slow slew inside applyOcclusion.
+        rtr::OcclusionParams op;
+        op.minCutoffHz   = cfg.occlMinCutoffHz;
+        op.bypassHz      = cfg.occlBypassHz;
+        op.maxAtten      = cfg.occlMaxAtten;
+        op.slewPerSample = 1.0f / (cfg.occlSlewMs * 0.001f * 48000.0f);
+        rtr::applyOcclusion(mono.data(), sampleCount,
+                            q.occlusion01 * cfg.occlStrength, rc.occl, 48000.0f, op);
         if (now - rc.lastAudioLogMs > 3000) {
             rc.lastAudioLogMs = now;
             char buf[160];
-            std::snprintf(buf, sizeof(buf), "audio '%s': dist=%.1fm pan=%+.2f gain=%.2f",
-                          matchName.c_str(), q.distM, pan, gain);
+            std::snprintf(buf, sizeof(buf), "audio '%s': dist=%.1fm pan=%+.2f gain=%.2f occl=%.2f",
+                          matchName.c_str(), q.distM, pan, gain, q.occlusion01);
             tsLog(buf);
         }
     }
@@ -402,7 +683,7 @@ RTR_EXPORT void ts3plugin_onEditPostProcessVoiceDataEvent(
             for (int i = 0; i < sampleCount; ++i) samples[i * channels + c] = 0;
     }
     const bool stereo = (li >= 0 && ri >= 0 && li != ri);
-    const float smooth = 0.002f;
+    const float smooth = cfg.proxSmooth;
     for (int i = 0; i < sampleCount; ++i) {
         rc.pan.gain += std::clamp(gain - rc.pan.gain, -smooth, smooth);
         rc.pan.pan  += std::clamp(pan  - rc.pan.pan,  -smooth, smooth);

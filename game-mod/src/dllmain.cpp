@@ -7,7 +7,7 @@
 //
 // Class/property names verified against the RoN UHT dump (see docs/DESIGN.md).
 
-#define RTR_MOD_VERSION L"0.4.3" // keep in step with ts3-plugin PLUGIN_VERSION / release tag
+#define RTR_MOD_VERSION L"0.5.0" // keep in step with ts3-plugin PLUGIN_VERSION / release tag
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -33,6 +33,9 @@
 #include <Unreal/UClass.hpp>
 #include <Unreal/UFunction.hpp>
 #include <Unreal/FString.hpp>
+#include <Unreal/FProperty.hpp>
+#include <Unreal/NameTypes.hpp>
+#include <Unreal/Property/FStructProperty.hpp>
 #include <Unreal/AActor.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
 
@@ -456,6 +459,187 @@ private:
         return {float(v.X / 100.0), float(v.Y / 100.0), float(v.Z / 100.0)};
     }
 
+    // ---- Occlusion: walls between camera and each speaker (docs/OCCLUSION.md)
+    // UKismetSystemLibrary::LineTraceSingle called through ProcessEvent with a
+    // hand-built param frame. Every field offset is resolved at runtime from
+    // the UFunction's own property layout, so an engine update shifts values
+    // instead of memory: a failed resolve disables occlusion, it never
+    // corrupts the frame.
+
+    // Camera farther than this from the possessed pawn = a menu/map camera
+    // (loadout, mission select). First-person + camera shake never exceeds
+    // a few meters; menu scenes are hundreds away.
+    static constexpr double kCamDetachCm     = 1000.0; // 10 m
+
+    static constexpr int    kMaxWallCount    = 4;      // trace cap per speaker
+    static constexpr int    kOcclusionPerWall = 85;    // RtrPlayer::occlusion units
+    static constexpr double kHeadOffsetCm    = 160.0;  // pawn root -> approx head
+    static constexpr double kAdvanceCm       = 10.0;   // step past each hit
+    static constexpr double kMaxTraceRangeCm = 4500.0; // past audible range: skip
+
+    struct TraceCall {
+        UObject*   ksl = nullptr; // KismetSystemLibrary CDO
+        UFunction* fn  = nullptr;
+        int32_t frameSize = 0;
+        int32_t offCtx = -1, offStart = -1, offEnd = -1, offChannel = -1,
+                offComplex = -1, offIgnore = -1, offDraw = -1, offOutHit = -1,
+                offIgnoreSelf = -1, offRet = -1;
+        int32_t offHitLoc = -1; // FHitResult::Location inside OutHit; -1 = binary mode
+        bool ok = false;
+    };
+
+    // Raw view of the TArray<AActor*> param. The native thunk reads reference
+    // params in place from the caller's frame; the engine never owns or frees
+    // Data, so it can point at a stack array that outlives the call.
+    struct FTArrayRaw { void* Data; int32_t Num; int32_t Max; };
+
+    void ResolveTrace()
+    {
+        // CDO/function re-found every tick like the other reflected calls;
+        // offsets only re-derived when the UFunction instance changes.
+        UObject* ksl = UObjectGlobals::StaticFindObject<UObject*>(
+            nullptr, nullptr, STR("/Script/Engine.Default__KismetSystemLibrary"));
+        UFunction* fn = ksl ? ksl->GetFunctionByNameInChain(STR("LineTraceSingle")) : nullptr;
+        if (!fn) { m_trace = {}; WarnTraceUnavailable(STR("function not found")); return; }
+        if (m_trace.ok && m_trace.fn == fn) { m_trace.ksl = ksl; return; }
+
+        TraceCall tc{};
+        tc.ksl = ksl;
+        tc.fn = fn;
+        tc.frameSize = fn->GetParmsSize();
+        auto off = [fn](const wchar_t* name) -> int32_t {
+            FProperty* p = fn->FindProperty(FName(name, FNAME_Find));
+            return p ? p->GetOffset_Internal() : -1;
+        };
+        tc.offCtx        = off(STR("WorldContextObject"));
+        tc.offStart      = off(STR("Start"));
+        tc.offEnd        = off(STR("End"));
+        tc.offChannel    = off(STR("TraceChannel"));
+        tc.offComplex    = off(STR("bTraceComplex"));
+        tc.offIgnore     = off(STR("ActorsToIgnore"));
+        tc.offDraw       = off(STR("DrawDebugType"));
+        tc.offIgnoreSelf = off(STR("bIgnoreSelf"));
+        tc.offRet        = off(STR("ReturnValue"));
+        if (FProperty* hit = fn->FindProperty(FName(STR("OutHit"), FNAME_Find))) {
+            tc.offOutHit = hit->GetOffset_Internal();
+            // Explicit type: GetStruct() returns TObjectPtr<UScriptStruct> in
+            // newer RE-UE4SS (raw pointer before) — both convert to this.
+            if (UScriptStruct* hs = static_cast<FStructProperty*>(hit)->GetStruct())
+                if (FProperty* loc = hs->FindProperty(FName(STR("Location"), FNAME_Find)))
+                    tc.offHitLoc = loc->GetOffset_Internal(); // LWC FVector: 3 doubles
+        }
+
+        // Every field we write must resolve and fit inside the reported frame.
+        const int32_t maxEnd = std::max({
+            tc.offCtx + 8, tc.offStart + 24, tc.offEnd + 24, tc.offChannel + 1,
+            tc.offComplex + 1, tc.offIgnore + (int32_t)sizeof(FTArrayRaw),
+            tc.offDraw + 1, tc.offOutHit + 1, tc.offIgnoreSelf + 1, tc.offRet + 1});
+        const int32_t minOff = std::min({tc.offCtx, tc.offStart, tc.offEnd,
+            tc.offChannel, tc.offComplex, tc.offIgnore, tc.offDraw, tc.offOutHit,
+            tc.offIgnoreSelf, tc.offRet});
+        tc.ok = minOff >= 0 && tc.frameSize > 0 && tc.frameSize <= 4096 &&
+                maxEnd <= tc.frameSize;
+        if (tc.ok)
+            m_traceBuf.assign(size_t(tc.frameSize) * 2, 0); // oversized on purpose
+        else
+            WarnTraceUnavailable(STR("param layout resolve failed"));
+        m_trace = tc;
+    }
+
+    void WarnTraceUnavailable(const wchar_t* why)
+    {
+        if (NowMs() - m_lastTraceWarn < 30000) return;
+        m_lastTraceWarn = NowMs();
+        Output::send<LogLevel::Warning>(
+            STR("[RoNTacticalRadio] occlusion disabled: LineTraceSingle {}\n"), why);
+    }
+
+    // One Visibility-channel trace. Requires m_trace.ok. Returns hit/no-hit;
+    // fills hitLoc (UE cm) when the FHitResult::Location offset is known.
+    bool TraceOnce(UObject* pc, const FVecD& start, const FVecD& end,
+                   UObject** ignoreList, int32_t ignoreCount, FVecD* hitLoc)
+    {
+        const TraceCall& tc = m_trace;
+        uint8_t* p = m_traceBuf.data();
+        std::memset(p, 0, m_traceBuf.size());
+        *reinterpret_cast<UObject**>(p + tc.offCtx) = pc;
+        *reinterpret_cast<FVecD*>(p + tc.offStart)  = start;
+        *reinterpret_cast<FVecD*>(p + tc.offEnd)    = end;
+        p[tc.offChannel]    = 0; // ETraceTypeQuery::TraceTypeQuery1 = Visibility
+        p[tc.offComplex]    = 0;
+        p[tc.offDraw]       = 0; // EDrawDebugTrace::None
+        p[tc.offIgnoreSelf] = 0; // ActorsToIgnore already covers both bodies
+        auto* arr = reinterpret_cast<FTArrayRaw*>(p + tc.offIgnore);
+        arr->Data = ignoreList;
+        arr->Num  = ignoreCount;
+        arr->Max  = ignoreCount;
+        tc.ksl->ProcessEvent(tc.fn, p);
+        if (hitLoc && tc.offHitLoc >= 0)
+            std::memcpy(hitLoc, p + tc.offOutHit + tc.offHitLoc, sizeof(FVecD));
+        return p[tc.offRet] != 0;
+    }
+
+    // Wall count between camera and a speaker's head (positions in UE cm):
+    // trace, step past the hit, re-trace; capped at kMaxWallCount. Without a
+    // usable hit location this degrades to binary blocked(1)/clear(0).
+    int CountWalls(UObject* pc, FVecD start, const FVecD& end,
+                   UObject* myPawn, UObject* speakerPawn)
+    {
+        UObject* ignore[2] = {myPawn, speakerPawn};
+        const double dx = end.X - start.X, dy = end.Y - start.Y, dz = end.Z - start.Z;
+        const double len = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (len < 1.0) return 0;
+        const FVecD dir{dx / len, dy / len, dz / len};
+
+        int walls = 0;
+        while (walls < kMaxWallCount) {
+            FVecD hit{};
+            if (!TraceOnce(pc, start, end, ignore, 2, &hit)) break;
+            ++walls;
+            if (m_trace.offHitLoc < 0) break; // binary mode: can't advance
+            // Progress along the ray; a garbage/backwards location (possible
+            // under layout drift) ends the loop with the count so far.
+            const double t = (hit.X - start.X) * dir.X + (hit.Y - start.Y) * dir.Y +
+                             (hit.Z - start.Z) * dir.Z;
+            if (!std::isfinite(t) || t <= 0.0) break;
+            start = {start.X + (t + kAdvanceCm) * dir.X,
+                     start.Y + (t + kAdvanceCm) * dir.Y,
+                     start.Z + (t + kAdvanceCm) * dir.Z};
+            const double remaining = (end.X - start.X) * dir.X +
+                                     (end.Y - start.Y) * dir.Y +
+                                     (end.Z - start.Z) * dir.Z;
+            if (remaining <= 1.0) break; // reached the speaker
+        }
+        return walls;
+    }
+
+    // Occlusion byte for one speaker; logs on change so the known-spots
+    // checklist (same room 0, closed door 1, across the map 4) is visible
+    // live in UE4SS.log while walking around.
+    uint8_t ComputeOcclusion(UObject* pc, const FVecD& camCm, bool camOk,
+                             const FVecD& pawnLocCm, UObject* myPawn,
+                             UObject* pawn, const char* name)
+    {
+        int walls = 0;
+        if (m_trace.ok && camOk && pawn != myPawn) {
+            FVecD headCm = pawnLocCm;
+            headCm.Z += kHeadOffsetCm;
+            const double dx = headCm.X - camCm.X, dy = headCm.Y - camCm.Y,
+                         dz = headCm.Z - camCm.Z;
+            if (dx * dx + dy * dy + dz * dz <= kMaxTraceRangeCm * kMaxTraceRangeCm)
+                walls = CountWalls(pc, camCm, headCm, myPawn, pawn);
+        }
+        auto it = m_lastOccl.find(name);
+        if (it == m_lastOccl.end() || it->second != walls) {
+            m_lastOccl[name] = walls;
+            wchar_t wname[RTR_NAME_LEN]{};
+            MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, RTR_NAME_LEN);
+            Output::send<LogLevel::Verbose>(
+                STR("[RoNTacticalRadio] occl '{}' = {} wall(s)\n"), wname, walls);
+        }
+        return uint8_t(std::min(255, walls * kOcclusionPerWall));
+    }
+
     // Reads camera + all player pawns from the local (client) world.
     // Class/function names confirmed against the RoN UHT dump:
     //   AReadyOrNotPlayerController -> PlayerCameraManager (prop, Engine)
@@ -504,6 +688,7 @@ private:
 
     void CollectGameState(RtrSharedState& s)
     {
+        m_myPs = nullptr; // same-tick pointer, re-resolved every tick
         UObject* pc = FindLocalPlayerController();
         if (!pc) { s.inGame = 0; return; }
 
@@ -546,8 +731,34 @@ private:
                 gotLoc ? STR("ok") : STR("MISSING"),
                 gotRot ? STR("ok") : STR("MISSING"));
         }
+        // Menu cameras (loadout, mission select) fly far from the pawn while
+        // OTHER players still hear us at the pawn — so listen from the pawn
+        // too, or the menu user loses all proximity voice (camera is past
+        // the falloff range) while still being heard by everyone.
+        FVecD myLoc{};
+        if (gotLoc && !locFromPawn && CallVec(myPawn, STR("K2_GetActorLocation"), myLoc)) {
+            const double dx = camLoc.X - myLoc.X, dy = camLoc.Y - myLoc.Y,
+                         dz = camLoc.Z - myLoc.Z;
+            const bool detached = dx * dx + dy * dy + dz * dz > kCamDetachCm * kCamDetachCm;
+            if (detached) {
+                camLoc = myLoc;
+                camLoc.Z += kHeadOffsetCm;
+                CallRot(myPawn, STR("K2_GetActorRotation"), camRot); // face with the body
+            }
+            if (detached != m_camDetached) {
+                m_camDetached = detached;
+                Output::send<LogLevel::Verbose>(
+                    STR("[RoNTacticalRadio] listener {} pawn (menu camera {})\n"),
+                    detached ? STR("snapped to") : STR("back on"),
+                    detached ? STR("detected") : STR("closed"));
+            }
+        }
+
         s.listenerPos = ToMeters(camLoc);
         if (locFromPawn) s.listenerPos.z += 1.6f; // pawn root -> approx head height
+        // Trace origin in UE cm, mirroring the head-height fixup above.
+        FVecD camCm = camLoc;
+        if (locFromPawn) camCm.Z += kHeadOffsetCm;
         // UE rotator (degrees) -> forward/up unit vectors (roll ignored).
         const float d2r = 3.14159265f / 180.0f;
         const float cp = std::cos(float(camRot.Pitch) * d2r), sp = std::sin(float(camRot.Pitch) * d2r);
@@ -556,6 +767,7 @@ private:
         s.listenerUp  = {-sp * cy, -sp * sy, cp};
 
         // --- Players (all replicated PlayerStates, skip CDOs) ---
+        ResolveTrace(); // occlusion trace call (CDO/function re-found per tick)
         m_pawns.clear();
         std::vector<UObject*> states{};
         UObjectGlobals::FindAllOf(STR("ReadyOrNotPlayerState"), states);
@@ -575,15 +787,19 @@ private:
             if (!CallVec(pawn, STR("K2_GetActorLocation"), loc)) continue;
             p.pos = ToMeters(loc);
             p.alive = CallBool(pawn, STR("IsDeadOrUnconscious"), false) ? 0 : 1;
+            p.occlusion = ComputeOcclusion(pc, camCm, gotLoc, loc, myPawn, pawn, p.name);
             m_pawns[p.name] = pawn;
             ++n;
         }
         s.playerCount = n;
 
-        // --- Local player name ---
+        // --- Local player name + state (state pointer valid this tick only) ---
         UObject** psPtr = pc->GetValuePtrByPropertyNameInChain<UObject*>(STR("PlayerState"));
-        if (psPtr && *psPtr)
+        if (psPtr && *psPtr) {
             CallNameUtf8(*psPtr, STR("GetPlayerName"), s.localName, RTR_NAME_LEN);
+            m_myPs = *psPtr;
+            m_localName = s.localName;
+        }
     }
 
     static bool SetMouthAlpha(UObject* anim, float alpha)
@@ -605,7 +821,16 @@ private:
     {
         RtrTalkMsg msg{};
         if (m_talkRx.Poll(msg)) m_talk = msg;
-        if (!inGame) { m_activeMouths.clear(); return; }
+        if (!inGame) { m_activeMouths.clear(); m_selfTalkSent = -1; return; }
+
+        // Native talking indicators: each client reports its OWN talk state
+        // (Server_PushToTalk is an owning-client RPC). IsTalking replicates,
+        // so the stock VOIP talker HUD lights up on every machine — this is
+        // how "who is talking" shows in-game with TS carrying the voice.
+        bool meTalking = false;
+        for (uint32_t i = 0; i < m_talk.count && i < RTR_TALK_MAX; ++i)
+            if (m_localName == m_talk.speakers[i].name) { meTalking = true; break; }
+
         if (m_talk.count == 0 && m_activeMouths.empty()) return; // idle: no work
 
         // pawn -> face anim map, valid for this tick only.
@@ -643,6 +868,20 @@ private:
         m_activeMouths = std::move(nowTalking);
     }
 
+    // Report our own talk state to the game once per change. m_myPs is a
+    // same-tick pointer set by CollectGameState (never cached across ticks).
+    void SyncSelfTalking(bool talking)
+    {
+        if (!m_myPs) return;
+        const int8_t want = talking ? 1 : 0;
+        if (m_selfTalkSent == want) return;
+        UFunction* fn = Fn(m_myPs, STR("Server_PushToTalk"));
+        if (!fn) return;
+        struct { bool bPushToTalk; } p{talking};
+        m_myPs->ProcessEvent(fn, &p);
+        m_selfTalkSent = want;
+    }
+
     RtrConfig m_cfg{};
     SharedMemWriter m_shm{};
     UdpSender m_udp{};
@@ -650,6 +889,10 @@ private:
     RtrTalkMsg m_talk{};
     std::unordered_map<std::string, UObject*> m_pawns; // this tick's players
     std::vector<std::string> m_activeMouths;
+    UObject* m_myPs = nullptr;    // local PlayerState, THIS tick only
+    std::string m_localName;      // local player's in-game name
+    int8_t m_selfTalkSent = -1;   // last Server_PushToTalk sent; -1 unknown
+    bool m_camDetached = false;   // menu camera far from pawn (log on change)
     bool     m_shmOk = false;
     bool     m_udpOk = false;
     uint64_t m_lastPublish = 0;
@@ -657,6 +900,10 @@ private:
     uint8_t  m_prevRadioPtt = 0;
     uint8_t  m_prevVoicePtt = 0;
     uint64_t m_lastCamWarn = 0;
+    uint64_t m_lastTraceWarn = 0;
+    TraceCall m_trace{};
+    std::vector<uint8_t> m_traceBuf;              // LineTraceSingle param frame
+    std::unordered_map<std::string, int> m_lastOccl; // wall count change log
     uint32_t m_faults = 0;
     uint32_t m_faultsLogged = 0;
     uint8_t  m_activeRadio = 0;

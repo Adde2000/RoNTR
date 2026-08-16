@@ -10,9 +10,13 @@
 // Windows shared memory; also serves as a fallback on Windows.
 #define RTR_UDP_PORT    39440
 #define RTR_TALK_UDP_PORT 39441
+// HTTP bridge for games whose mods can't open sockets (Arma Reforger:
+// EnforceScript RestApi POSTs text state, response carries talk state).
+// Wire format: ts3-plugin/src/httpbridge.hpp.
+#define RTR_HTTP_PORT   39442
 #define RTR_TALK_MAX      8
 #define RTR_MAGIC       0x31525452u /* "RTR1" */
-#define RTR_VERSION     2u
+#define RTR_VERSION     3u
 #define RTR_MAX_PLAYERS 32
 #define RTR_NAME_LEN    64
 #define RTR_MAX_RADIOS  4
@@ -27,7 +31,8 @@ typedef struct RtrPlayer {
     char    name[RTR_NAME_LEN]; // in-game player name, UTF-8, NUL-terminated
     RtrVec3 pos;
     uint8_t alive;              // 0 = dead/incapacitated (future: dead can't talk)
-    uint8_t _pad[3];
+    uint8_t occlusion;          // 0 = clear line of sight; each wall adds ~85, saturating
+    uint8_t _pad[2];
 } RtrPlayer;
 
 typedef struct RtrSharedState {
