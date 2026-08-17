@@ -7,7 +7,7 @@
 //
 // Class/property names verified against the RoN UHT dump (see docs/DESIGN.md).
 
-#define RTR_MOD_VERSION L"0.5.0" // keep in step with ts3-plugin PLUGIN_VERSION / release tag
+#define RTR_MOD_VERSION L"0.5.1" // keep in step with ts3-plugin PLUGIN_VERSION / release tag
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN

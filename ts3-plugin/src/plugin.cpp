@@ -6,7 +6,7 @@
 //   https://github.com/teamspeak/ts3client-pluginsdk
 // Install: %APPDATA%/TS3Client/plugins/ron_tactical_radio.dll
 
-#define PLUGIN_VERSION "0.5.0" // keep in step with game-mod ModVersion / release tag
+#define PLUGIN_VERSION "0.5.1" // keep in step with game-mod ModVersion / release tag
 #define PLUGIN_NAME "RoN Tactical Radio"
 #define PLUGIN_API_VERSION 26
 
