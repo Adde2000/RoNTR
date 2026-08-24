@@ -12,11 +12,15 @@ response carries back who is currently audible in TeamSpeak (for talk
 indicators / mouth animation). That's the whole protocol — one endpoint each
 way, plain text, no dependencies.
 
-> **The bridge is a compile-time plugin option, OFF by default.** Integrations
-> need a plugin built with it enabled: `scripts\build.ps1 -TsPluginOnly
-> -HttpBridge` (Windows) or `RTR_HTTP_BRIDGE=1 ./scripts/build-linux-plugin.sh`
-> (Linux). A bridge-free plugin logs `http bridge disabled (build option)` at
-> load and does not listen on the port at all.
+> **The bridge ships in every plugin build and is ON by default**, controlled
+> by the runtime settings `bridge.enable` and `bridge.port` (`/rtr set
+> bridge.enable 0`, `/rtr set bridge.port 39500` in the TS chat, the addon
+> settings dialog, or the ini — hot-applied within ~1 s like every other
+> setting). Disabled means no listener on the port at all; a port change
+> restarts the listener. The TS log says `http bridge stopped
+> (bridge.enable = 0)` / `http bridge listening on 127.0.0.1:<port>` as the
+> settings change. Moving the port is how the dev state viewer
+> (`tools/state-viewer/`) is put in front as a relay on 39442.
 
 ```
 game mod --- POST /state (10 Hz) --->  127.0.0.1:39442 (TS plugin)
@@ -60,6 +64,7 @@ fails safe. Order doesn't matter.
 | `freq` | kHz integer | Shorthand: fills radio slot 0. |
 | `freqs` | `kHz,kHz,...` | Up to 4 tuned radio slots. `0` = slot unused. |
 | `activeradio` | `0..3` | Which slot transmits on PTT. Default 0. |
+| `ears` | `b,l,r,...` | Per-slot ear routing for received radio audio: `b` both (default), `l` left only, `r` right only. Digits `0`/`1`/`2` also accepted; unknown values mean both. |
 | `player` | `Name\|x\|y\|z\|alive\|occl` | One line per player, **including the local player**. |
 
 `player` fields: position in meters (same space as `lpos`); `alive` `0`/`1`
@@ -107,7 +112,8 @@ animation. Names are the same ids as the `player=`/`name` fields.
 1. `GET /health` on startup; warn the player if absent or `rtr=` differs.
 2. Post `ingame=0` whenever there is no possessed character; resume real
    state on possession. Never stop posting while the game runs.
-3. Send `game=<your-id>` so multi-game debugging stays sane.
+3. Send `game=<your-id>` so multi-game debugging stays sane — it is also
+   shown in other TS clients' info panel next to the plugin version.
 4. Map keys game-side (PTT, frequency stepping) — the plugin only consumes
    the resulting state.
 5. Mute/suppress the game's native voice system; TeamSpeak is the only
@@ -125,6 +131,12 @@ Smoke test without a game:
 curl -X POST --data-binary $'rtr=3\ningame=1\nname=Me\nlpos=0 0 0\nlfwd=1 0 0\nlup=0 0 1\nplayer=Me|0|0|0|1|0' http://127.0.0.1:39442/state
 curl http://127.0.0.1:39442/health
 ```
+
+**Dev dashboard:** `tools/state-viewer/` is a containerized Node stand-in
+for this bridge — run it instead of TeamSpeak (same port, same contract) and
+browse `http://127.0.0.1:39442/` to watch positions, occlusion, radio
+channels, PTT and the raw payload live, and to inject fake `talk=` responses.
+See its README.
 
 ## Versioning
 

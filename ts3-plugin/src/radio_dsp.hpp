@@ -139,6 +139,45 @@ inline void applyOcclusion(float* mono, int count, float targetO,
     }
 }
 
+// --- Voice leveler: gentle per-voice compressor (TFAR-style) ----------------
+// TFAR runs a fast compressor (chunkware SimpleComp, 1 ms attack / 300 ms
+// release) over every incoming voice, which is most of the "processed" feel
+// its local voices have. This is the same idea: a feed-forward peak
+// compressor that evens out mic loudness differences between speakers.
+// Applied to the raw voice BEFORE distance gain, so quiet and loud mics
+// level out while distance attenuation stays fully intact.
+struct CompressorParams {
+    float threshold = 0.20f;  // linear amplitude where compression starts
+    float ratio     = 3.0f;   // n:1 reduction above the threshold
+    float attackMs  = 1.0f;   // TFAR's SimpleComp settings
+    float releaseMs = 300.0f;
+    float makeup    = 1.4f;   // output gain after compression
+};
+
+// Per-stream envelope: caller passes the SAME struct across frames.
+struct CompressorState { float env = 0.0f; };
+
+inline void applyCompressor(float* mono, int count, CompressorState& st,
+                            float sampleRate = 48000.0f,
+                            const CompressorParams& p = {})
+{
+    const float aAtk = 1.0f - std::exp(-1.0f / (p.attackMs  * 0.001f * sampleRate));
+    const float aRel = 1.0f - std::exp(-1.0f / (p.releaseMs * 0.001f * sampleRate));
+    for (int i = 0; i < count; ++i) {
+        const float level = std::fabs(mono[i]);
+        if (level > st.env)
+            st.env += aAtk * (level - st.env);
+        else
+            st.env += aRel * (level - st.env);
+        float gain = 1.0f;
+        if (st.env > p.threshold) {
+            const float compressed = p.threshold + (st.env - p.threshold) / p.ratio;
+            gain = compressed / st.env;
+        }
+        mono[i] = std::clamp(mono[i] * gain * p.makeup, -1.0f, 1.0f);
+    }
+}
+
 // --- Proximity: distance gain + constant-power stereo pan -------------------
 struct ProximityParams {
     float maxDistM = 40.0f;

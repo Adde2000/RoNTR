@@ -143,6 +143,14 @@ public:
     // poll() records native freshness here; public so tests can simulate it.
     void noteNativeUpdate(uint64_t nowMs) { m_lastNativeMs = nowMs; }
 
+    // True while a native transport (shm/UDP) delivered data within the last
+    // second — i.e. the current state comes from RoN, not an HTTP integration.
+    bool nativeFresh(uint64_t nowMs) const
+    {
+        const uint64_t n = m_lastNativeMs.load();
+        return n != 0 && nowMs - n < 1000;
+    }
+
     // Nonzero when data with our magic but a DIFFERENT protocol version was
     // seen (game mod and plugin out of step). For diagnostics only.
     uint32_t mismatchedPeerVersion() const { return m_peerVersion.load(); }

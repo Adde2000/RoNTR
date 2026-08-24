@@ -4,9 +4,6 @@ param(
     [string]$Root = (Split-Path $PSScriptRoot -Parent),
     [switch]$GameModOnly,
     [switch]$TsPluginOnly,
-    # Build the plugin variant with the localhost HTTP state bridge
-    # (Arma Reforger integration) compiled in. Default: no bridge.
-    [switch]$HttpBridge,
     # RE-UE4SS uses UE-style config triplets, not Release/Debug.
     [string]$GameModConfig = 'Game__Shipping__Win64'
 )
@@ -17,10 +14,8 @@ if (-not $GameModOnly) {
     Write-Host "== Building TS3 plugin ==" -ForegroundColor Cyan
     $sdk = Join-Path $Root 'third_party\ts3client-pluginsdk'
     if (-not (Test-Path $sdk)) { throw "TS3 SDK missing - run scripts\setup.ps1 first." }
-    $bridge = 'OFF'
-    if ($HttpBridge) { $bridge = 'ON' }
     cmake -S (Join-Path $Root 'ts3-plugin') -B (Join-Path $build 'ts3-plugin') -A x64 `
-          -DTS3_PLUGINSDK_DIR="$sdk" "-DRTR_HTTP_BRIDGE=$bridge"
+          -DTS3_PLUGINSDK_DIR="$sdk"
     if ($LASTEXITCODE) { throw "TS3 plugin configure failed" }
     cmake --build (Join-Path $build 'ts3-plugin') --config Release
     if ($LASTEXITCODE) { throw "TS3 plugin build failed" }

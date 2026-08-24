@@ -235,12 +235,20 @@ static void testHttpMultiRadioAndGameId()
         "game=arma-reforger\n"
         "ingame=1\n"
         "freqs=42000,51000,63000\n"
-        "activeradio=1\n";
+        "activeradio=1\n"
+        "ears=l,r,b\n";
     CHECK(rtr::parseStateText(body, st, &gameId) == rtr::ParseResult::Ok);
     CHECK(gameId == "arma-reforger");
     CHECK(st.radioFreqKhz[0] == 42000u && st.radioFreqKhz[1] == 51000u);
     CHECK(st.radioFreqKhz[2] == 63000u && st.radioFreqKhz[3] == 0u);
     CHECK(st.activeRadio == 1);
+    CHECK(st.radioEars[0] == 1 && st.radioEars[1] == 2);
+    CHECK(st.radioEars[2] == 0 && st.radioEars[3] == 0); // b + unsent = both
+
+    // Digits work too; garbage falls back to "both"; no ears line = all both.
+    RtrSharedState stEars{};
+    CHECK(rtr::parseStateText("rtr=3\nears=1,2,x\n", stEars) == rtr::ParseResult::Ok);
+    CHECK(stEars.radioEars[0] == 1 && stEars.radioEars[1] == 2 && stEars.radioEars[2] == 0);
 
     // activeradio clamps; freq= (singular) still fills slot 0
     RtrSharedState st2{};
@@ -322,6 +330,30 @@ static void testSettings()
         CHECK(std::fabs(a.*(d.field) - b.*(d.field)) < 1e-4f * std::max(1.0f, a.*(d.field)));
 }
 
+static void testVoiceCompressor()
+{
+    const rtr::CompressorParams p{}; // thresh 0.20, ratio 3, makeup 1.4
+
+    // Loud steady signal: env converges to the input level, output is pulled
+    // well below input*makeup (0.9 * 1.4 = 1.26 uncompressed).
+    rtr::CompressorState loudSt;
+    std::vector<float> loud(48000, 0.9f);
+    rtr::applyCompressor(loud.data(), int(loud.size()), loudSt, 48000.0f, p);
+    CHECK(loud.back() > 0.4f && loud.back() < 0.75f);
+
+    // Quiet signal below the threshold: only makeup gain applies.
+    rtr::CompressorState quietSt;
+    std::vector<float> quiet(48000, 0.1f);
+    rtr::applyCompressor(quiet.data(), int(quiet.size()), quietSt, 48000.0f, p);
+    CHECK(std::fabs(quiet.back() - 0.1f * p.makeup) < 0.01f);
+
+    // Output never exceeds full scale, even on clipped input.
+    rtr::CompressorState hotSt;
+    std::vector<float> hot(4800, 1.0f);
+    rtr::applyCompressor(hot.data(), int(hot.size()), hotSt, 48000.0f, p);
+    for (float v : hot) CHECK(v <= 1.0f && v >= -1.0f);
+}
+
 static void testProximityMutesFar()
 {
     std::vector<int16_t> buf(480 * 2, 10000);
@@ -386,6 +418,7 @@ int main()
     testHttpBodyNormalization();
     testTalkText();
     testSettings();
+    testVoiceCompressor();
     testProximityMutesFar();
 #ifndef _WIN32
     testUdpTransport();

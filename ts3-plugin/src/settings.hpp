@@ -33,6 +33,15 @@ struct Settings {
     // Radio effect
     float radioDrive = 4.0f;  // distortion drive
     float radioNoise = 0.005f; // static noise level
+    // Proximity voice leveler (TFAR-style per-voice compressor)
+    float voiceComp        = 1.0f;  // 0 = off
+    float voiceCompThresh  = 0.20f; // linear amplitude where compression starts
+    float voiceCompRatio   = 3.0f;  // n:1 above the threshold
+    float voiceCompMakeup  = 1.4f;  // output gain after compression
+    // REST bridge (localhost HTTP listener for non-RoN game integrations)
+    float bridgeEnable = 1.0f;     // 0 = no listener at all
+    float bridgePort   = 39442.0f; // listen port; change to put a dev relay
+                                   // (tools/state-viewer) in front on 39442
     // Diagnostics
     float debugLog = 0.0f;    // 1 = dump received game state to the TS log
 };
@@ -69,6 +78,18 @@ inline const std::vector<SettingDesc>& settingsTable()
          "radio distortion drive"},
         {"radio.noise",     &Settings::radioNoise,     0.0f,   0.2f,
          "radio static level"},
+        {"voice.comp",      &Settings::voiceComp,      0.0f,   1.0f,
+         "1 = TFAR-style leveler/compressor on proximity voices, 0 = off"},
+        {"voice.compthresh", &Settings::voiceCompThresh, 0.05f, 0.9f,
+         "compressor threshold (linear amplitude)"},
+        {"voice.compratio", &Settings::voiceCompRatio, 1.0f,   10.0f,
+         "compression ratio above the threshold"},
+        {"voice.compmakeup", &Settings::voiceCompMakeup, 0.5f,  4.0f,
+         "makeup gain after compression"},
+        {"bridge.enable",   &Settings::bridgeEnable,   0.0f,   1.0f,
+         "1 = REST bridge for other games (see bridge.port), 0 = off"},
+        {"bridge.port",     &Settings::bridgePort,     1024.0f, 65535.0f,
+         "REST bridge listen port; restarts the listener on change (default 39442)"},
         {"debug.log",       &Settings::debugLog,       0.0f,   1.0f,
          "1 = dump received game state to the TS log every ~2s"},
     };

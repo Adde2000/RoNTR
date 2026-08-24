@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RoNTR State Viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --line: #30363d;
+    --fg: #c9d1d9; --dim: #8b949e; --accent: #d97e28;
+    --ok: #3fb950; --bad: #f85149; --lcd: #93a86b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 14px; padding: 10px 18px;
+           background: var(--panel); border-bottom: 1px solid var(--line);
+           flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: 1px; }
+  .dot { width: 11px; height: 11px; border-radius: 50%; background: var(--bad);
+         display: inline-block; }
+  .dot.ok { background: var(--ok); }
+  .pill { background: #21262d; border: 1px solid var(--line); border-radius: 12px;
+          padding: 1px 10px; font-size: 12px; color: var(--dim); }
+  .pill b { color: var(--fg); font-weight: 600; }
+  main { display: grid; grid-template-columns: 380px 1fr; gap: 14px;
+         padding: 14px 18px; align-items: start; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line);
+            border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; }
+  section h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
+               letter-spacing: 1.5px; color: var(--dim); }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 3px 8px 3px 0; white-space: nowrap; }
+  th { color: var(--dim); font-weight: 500; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .mono { font-family: Consolas, monospace; }
+  .radio-slot { display: flex; align-items: center; gap: 10px; padding: 5px 0; }
+  .radio-slot .freq { font-family: Consolas, monospace; font-size: 22px;
+                      color: var(--lcd); background: #10140c; padding: 2px 10px;
+                      border-radius: 4px; min-width: 108px; text-align: center; }
+  .radio-slot .role { width: 34px; color: var(--dim); font-size: 12px; }
+  .tag { font-size: 11px; border: 1px solid var(--line); border-radius: 4px;
+         padding: 0 6px; color: var(--dim); }
+  .tag.tx { border-color: var(--bad); color: var(--bad); font-weight: 700; }
+  .tag.ear { min-width: 44px; text-align: center; }
+  .bar { background: #21262d; border-radius: 3px; height: 9px; width: 90px;
+         overflow: hidden; display: inline-block; vertical-align: middle; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  canvas { width: 100%; background: #0a0e14; border: 1px solid var(--line);
+           border-radius: 6px; }
+  pre { background: #0a0e14; border: 1px solid var(--line); border-radius: 6px;
+        padding: 8px 10px; font-size: 12px; overflow: auto; max-height: 260px;
+        color: var(--dim); }
+  .talk-row { display: flex; gap: 8px; align-items: center; margin: 4px 0; }
+  input[type=text] { background: #0a0e14; color: var(--fg); border: 1px solid var(--line);
+                     border-radius: 4px; padding: 3px 8px; width: 140px; }
+  input[type=range] { flex: 1; }
+  button { background: #21262d; color: var(--fg); border: 1px solid var(--line);
+           border-radius: 4px; padding: 3px 12px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .warn { color: var(--bad); font-size: 12px; }
+  .kv td:first-child { color: var(--dim); padding-right: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <span id="linkDot" class="dot"></span>
+  <h1>RoNTR STATE VIEWER</h1>
+  <span class="pill">game <b id="hGame">—</b></span>
+  <span class="pill">status <b id="hStatus">no link</b></span>
+  <span class="pill">rate <b id="hHz">0.0</b> Hz</span>
+  <span class="pill">posts <b id="hPosts">0</b></span>
+  <span class="pill">rejected <b id="hBad">0</b></span>
+  <span class="pill">relay <b id="hRelay">off</b></span>
+  <span id="hErr" class="warn"></span>
+</header>
+<main>
+<div id="colLeft">
+  <section>
+    <h2>Radio</h2>
+    <div id="radioSlots"></div>
+  </section>
+  <section>
+    <h2>Listener</h2>
+    <table class="kv mono" id="listenerTable"></table>
+  </section>
+  <section>
+    <h2>Relay — forward state to the TS plugin</h2>
+    <div class="talk-row">
+      <label style="display:flex;align-items:center;gap:6px">
+        <input type="checkbox" id="relayOn"> on</label>
+      <input type="text" id="relayTarget" placeholder="39500  /  host:port" style="width:190px">
+      <button id="relayApply">apply</button>
+    </div>
+    <div id="relayStatus" class="mono" style="font-size:12px;color:var(--dim);margin-top:4px">—</div>
+    <div style="font-size:12px;color:var(--dim);margin-top:4px">
+      Move the plugin first: <span class="mono">/rtr set bridge.port 39500</span> in TS chat.
+      A bare number targets the machine the game runs on
+      (<span class="mono">host.docker.internal</span> when the viewer is in Docker).</div>
+  </section>
+  <section>
+    <h2>Talk injector — echoed back to the game as talk= lines</h2>
+    <div id="talkRows"></div>
+    <button id="talkAdd">+ add speaker</button>
+  </section>
+  <section>
+    <h2>Extra / unknown keys</h2>
+    <table class="kv mono" id="extrasTable"></table>
+  </section>
+</div>
+<div id="colRight">
+  <section>
+    <h2>Map — top-down, listener-centered (grid: 10 m)</h2>
+    <canvas id="map" width="900" height="560"></canvas>
+  </section>
+  <section>
+    <h2>Players</h2>
+    <table id="playersTable">
+      <thead><tr><th>name</th><th>x</th><th>y</th><th>z</th><th>dist</th>
+                 <th>alive</th><th>occlusion</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+  <section>
+    <h2>Raw payload</h2>
+    <pre id="rawPre">—</pre>
+  </section>
+</div>
+</main>
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const EARS = { b: 'BOTH', l: 'LEFT', r: 'RIGHT' };
+const ROLES = ['PRI', 'SEC', 'R3', 'R4'];
+let talkers = [];
+let talkDirty = false;
+
+function fmtFreq(khz) {
+  return (khz / 1000).toFixed(2).padStart(6, '0');
+}
+function fmtVec(v) {
+  return v ? `${v.x.toFixed(2)}  ${v.y.toFixed(2)}  ${v.z.toFixed(2)}` : '—';
+}
+function dist(a, b) {
+  if (!a || !b) return 0;
+  return Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+}
+
+// ------------------------------------------------------------- rendering ---
+function renderHeader(d) {
+  const up = d.ageMs !== null && d.ageMs < 1000;
+  $('linkDot').className = 'dot' + (up ? ' ok' : '');
+  $('hGame').textContent = d.gameId || '—';
+  const st = d.state;
+  $('hStatus').textContent = !up ? 'no link'
+    : (st && st.ingame ? 'in game' : 'menus (ingame=0)');
+  $('hHz').textContent = d.hz.toFixed(1);
+  $('hPosts').textContent = d.totalPosts;
+  $('hBad').textContent = d.badPosts;
+  $('hErr').textContent = d.lastError
+    ? `last reject: ${d.lastError.why} — ${d.lastError.preview.slice(0, 60)}` : '';
+  renderRelay(d.relay || {});
+}
+
+let relayUiInited = false;
+function renderRelay(r) {
+  const rEl = $('hRelay');
+  if (!r.enabled) {
+    rEl.textContent = 'off';
+    rEl.style.color = '';
+  } else if (r.lastErr) {
+    rEl.textContent = `${r.target} — error`;
+    rEl.style.color = 'var(--bad)';
+  } else {
+    rEl.textContent = `${r.target} (${r.forwarded} fwd)`;
+    rEl.style.color = 'var(--ok)';
+  }
+  let status = !r.enabled
+    ? `off — target ${r.target || 'not set'}`
+    : r.lastErr
+      ? `FAILING: ${r.lastErr} (${r.failed} failed)`
+      : `forwarding to ${r.target}/state — ${r.forwarded} ok, ${r.failed} failed`;
+  if (r.hint) status += ` — ${r.hint}`;
+  $('relayStatus').textContent = status;
+  $('relayStatus').style.color = (r.enabled && r.lastErr) || r.hint ? 'var(--bad)' : '';
+  if (!relayUiInited) {
+    relayUiInited = true;
+    $('relayOn').checked = !!r.enabled;
+    if (r.target) $('relayTarget').value = r.target;
+  }
+}
+
+async function applyRelay() {
+  const body = {
+    enabled: $('relayOn').checked,
+    target: $('relayTarget').value.trim(),
+  };
+  try {
+    const res = await fetch('/api/relay', { method: 'POST', body: JSON.stringify(body) });
+    const r = await res.json();
+    if (r.error) {
+      $('relayStatus').textContent = r.error;
+      $('relayStatus').style.color = 'var(--bad)';
+      return;
+    }
+    $('relayOn').checked = !!r.enabled;
+    if (r.target) $('relayTarget').value = r.target;
+    renderRelay(r);
+  } catch (e) {
+    $('relayStatus').textContent = 'viewer unreachable';
+  }
+}
+
+function renderRadio(st) {
+  const el = $('radioSlots');
+  if (!st) { el.textContent = '—'; return; }
+  let html = '';
+  for (let i = 0; i < st.freqs.length; i++) {
+    if (i >= 2 && !st.freqs[i]) continue; // slots 3/4 only when used
+    const tx = st.radioptt && st.activeradio === i;
+    html += `<div class="radio-slot">
+      <span class="role">${ROLES[i]}</span>
+      <span class="freq">${fmtFreq(st.freqs[i])}</span>
+      <span class="tag ear">${EARS[st.ears[i]] || 'BOTH'}</span>
+      ${st.freqs[i] ? '' : '<span class="tag">off</span>'}
+      ${tx ? '<span class="tag tx">TX</span>' : ''}
+    </div>`;
+  }
+  html += `<div style="margin-top:6px">
+    <span class="tag ${st.radioptt ? 'tx' : ''}">radioptt=${st.radioptt}</span>
+    <span class="tag">voiceptt=${st.voiceptt}</span>
+    <span class="tag">activeradio=${st.activeradio}</span></div>`;
+  el.innerHTML = html;
+}
+
+function renderListener(st) {
+  const t = $('listenerTable');
+  if (!st) { t.innerHTML = ''; return; }
+  t.innerHTML = `
+    <tr><td>name</td><td>${st.name || '—'}</td></tr>
+    <tr><td>pos</td><td>${fmtVec(st.lpos)}</td></tr>
+    <tr><td>fwd</td><td>${fmtVec(st.lfwd)}</td></tr>
+    <tr><td>up</td><td>${fmtVec(st.lup)}</td></tr>`;
+}
+
+function renderExtras(st) {
+  const t = $('extrasTable');
+  if (!st || !Object.keys(st.extras).length) { t.innerHTML = '<tr><td>—</td></tr>'; return; }
+  t.innerHTML = Object.entries(st.extras)
+    .map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+}
+
+function renderPlayers(st) {
+  const tb = $('playersTable').querySelector('tbody');
+  if (!st) { tb.innerHTML = ''; return; }
+  tb.innerHTML = st.players.map((p) => {
+    const d = st.lpos ? dist(st.lpos, p).toFixed(1) + ' m' : '—';
+    const local = p.name === st.name ? ' style="color:var(--accent)"' : '';
+    return `<tr${local}><td>${p.name}</td>
+      <td class="num">${p.x.toFixed(1)}</td><td class="num">${p.y.toFixed(1)}</td>
+      <td class="num">${p.z.toFixed(1)}</td><td class="num">${d}</td>
+      <td>${p.alive ? 'yes' : '<span class="warn">dead</span>'}</td>
+      <td><span class="bar"><i style="width:${(p.occl / 255 * 100).toFixed(0)}%"></i></span>
+          <span class="num"> ${p.occl}</span></td></tr>`;
+  }).join('');
+}
+
+function renderMap(st) {
+  const cv = $('map'), ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  if (!st || !st.lpos) return;
+  const cx = cv.width / 2, cy = cv.height / 2;
+  // Ground plane is X/Z (Y is up in Enfusion payloads). +z up on screen.
+  let maxR = 10;
+  for (const p of st.players)
+    maxR = Math.max(maxR, Math.hypot(p.x - st.lpos.x, p.z - st.lpos.z));
+  const scale = (Math.min(cx, cy) - 24) / maxR;
+
+  ctx.strokeStyle = '#1b2330';
+  ctx.fillStyle = '#40506b';
+  ctx.font = '11px Consolas';
+  for (let r = 10; r <= maxR + 9; r += 10) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, r * scale, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillText(r + 'm', cx + r * scale + 3, cy - 3);
+  }
+
+  // Listener + facing arrow.
+  if (st.lfwd) {
+    const a = Math.atan2(st.lfwd.x, st.lfwd.z);
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(a);
+    ctx.fillStyle = '#d97e28';
+    ctx.beginPath();
+    ctx.moveTo(0, -14); ctx.lineTo(6, 6); ctx.lineTo(-6, 6);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  for (const p of st.players) {
+    if (p.name === st.name) continue;
+    const dx = (p.x - st.lpos.x) * scale;
+    const dz = (p.z - st.lpos.z) * scale;
+    const px = cx + dx, py = cy - dz;
+    const occ = p.occl / 255;
+    ctx.fillStyle = !p.alive ? '#555'
+      : `rgb(${Math.round(63 + occ * 185)}, ${Math.round(185 - occ * 110)}, 80)`;
+    ctx.beginPath();
+    ctx.arc(px, py, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#c9d1d9';
+    ctx.fillText(p.name, px + 9, py + 4);
+  }
+}
+
+// ---------------------------------------------------------- talk injector --
+function renderTalkers() {
+  const el = $('talkRows');
+  el.innerHTML = '';
+  talkers.forEach((t, i) => {
+    const row = document.createElement('div');
+    row.className = 'talk-row';
+    row.innerHTML = `<input type="text" value="${t.name}" placeholder="player name">
+      <input type="range" min="0" max="1" step="0.05" value="${t.amp}">
+      <span class="num mono" style="width:34px">${Number(t.amp).toFixed(2)}</span>
+      <button>×</button>`;
+    const [name, amp] = row.querySelectorAll('input');
+    name.oninput = () => { t.name = name.value; talkDirty = true; };
+    amp.oninput = () => {
+      t.amp = Number(amp.value);
+      row.querySelector('span').textContent = t.amp.toFixed(2);
+      talkDirty = true;
+    };
+    row.querySelector('button').onclick = () => {
+      talkers.splice(i, 1); talkDirty = true; renderTalkers();
+    };
+    el.appendChild(row);
+  });
+}
+$('relayApply').onclick = applyRelay;
+$('relayOn').onchange = applyRelay;
+$('relayTarget').onkeydown = (e) => { if (e.key === 'Enter') applyRelay(); };
+
+$('talkAdd').onclick = () => {
+  talkers.push({ name: 'Speaker' + (talkers.length + 1), amp: 0.8 });
+  talkDirty = true;
+  renderTalkers();
+};
+setInterval(() => {
+  if (!talkDirty) return;
+  talkDirty = false;
+  fetch('/api/talk', { method: 'POST', body: JSON.stringify(talkers) }).catch(() => {});
+}, 300);
+
+// ------------------------------------------------------------------ poll ---
+async function poll() {
+  try {
+    const d = await (await fetch('/api/state')).json();
+    renderHeader(d);
+    renderRadio(d.state);
+    renderListener(d.state);
+    renderExtras(d.state);
+    renderPlayers(d.state);
+    renderMap(d.state);
+    $('rawPre').textContent = d.raw || '—';
+  } catch (e) {
+    $('linkDot').className = 'dot';
+    $('hStatus').textContent = 'viewer unreachable';
+  }
+}
+setInterval(poll, 200);
+poll();
+renderTalkers();
+</script>
+</body>
+</html>

@@ -6,15 +6,17 @@
 //   https://github.com/teamspeak/ts3client-pluginsdk
 // Install: %APPDATA%/TS3Client/plugins/ron_tactical_radio.dll
 
-#define PLUGIN_VERSION "0.5.0" // keep in step with game-mod ModVersion / release tag
+#define PLUGIN_VERSION "0.6.0" // keep in step with game-mod ModVersion / release tag
 #define PLUGIN_NAME "RoN Tactical Radio"
 #define PLUGIN_API_VERSION 26
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -29,9 +31,7 @@
 #include "plugin_definitions.h"
 
 #include "gamelink.hpp"
-#ifdef RTR_HTTP_BRIDGE
 #include "httpbridge.hpp"
-#endif
 #include "radio_dsp.hpp"
 #include "settings.hpp"
 #include "config_win.hpp"
@@ -48,9 +48,8 @@ static struct TS3Functions ts3Functions;
 
 static char* s_pluginID = nullptr;
 static rtr::GameLink s_link;
-#ifdef RTR_HTTP_BRIDGE
-static rtr::HttpBridge s_http; // Arma Reforger transport (RestApi loopback)
-#endif
+static rtr::HttpBridge s_http; // REST transport for other games (docs/HTTP-BRIDGE.md)
+static bool s_httpRunning = false; // init + poll thread only (sequenced)
 static std::thread s_pollThread;
 static std::atomic<bool> s_running{false};
 
@@ -58,10 +57,14 @@ static std::atomic<bool> s_running{false};
 struct RemoteClient {
     std::string nickname;      // TS nickname (fallback matching)
     std::string gameName;      // from HELLO
+    std::string pluginVersion; // from INFO (shown in the client info panel)
+    std::string game;          // from INFO; "" = not connected to a game
+    bool        infoKnown = false; // an INFO was received from this client
     uint32_t    txFreqKhz = 0; // nonzero while transmitting on radio
     rtr::RadioEffect radio;
     rtr::PanState pan;
     rtr::OcclusionState occl;  // wall muffling (proximity path only)
+    rtr::CompressorState comp; // voice leveler (proximity path only)
     uint64_t    lastAudioLogMs = 0; // throttled diagnostics
     float       amp = 0.0f;         // smoothed loudness 0..1 (drives mouth anim)
     uint64_t    lastAudioMs = 0;    // last time we processed audio from them
@@ -76,6 +79,13 @@ static uint64 s_sch = 0; // active server connection
 static rtr::Settings s_settings;
 static std::string s_settingsPath;                     // <TS config>/ron_tactical_radio.ini
 static std::filesystem::file_time_type s_settingsMtime;
+
+// Which game this client is currently linked to, for the INFO announce and
+// our own info panel: "ready-or-not" while a native (shm/UDP) link is fresh,
+// the REST bridge's game= id while HTTP owns the link, "" when no game.
+// Guarded by s_mtx (poll thread writes, bridge + UI threads read/write).
+static std::string s_infoGame;
+static std::string s_bridgeGame; // last game= id accepted from the REST bridge
 
 static uint64_t nowMs()
 {
@@ -106,6 +116,43 @@ static void sendCmd(const std::string& cmd)
     if (!s_pluginID || !s_sch) return;
     ts3Functions.sendPluginCommand(s_sch, s_pluginID, cmd.c_str(),
                                    PluginCommandTarget_CURRENT_CHANNEL, nullptr, nullptr);
+}
+
+// Value of "key=" in a space-separated command ("INFO ver=0.5.0 game=x").
+static std::string cmdToken(const std::string& cmd, const char* key)
+{
+    const size_t at = cmd.find(key);
+    if (at == std::string::npos) return {};
+    const size_t start = at + std::strlen(key);
+    const size_t end = cmd.find(' ', start);
+    return cmd.substr(start, end == std::string::npos ? std::string::npos : end - start);
+}
+
+// INFO announce: plugin version + current game, shown in other clients'
+// info panel. Server-wide so version is visible across channels; sent on
+// connect and whenever the game changes, plus once targeted back at each
+// newly-seen plugin user (late-join discovery).
+static std::string infoCmd(std::string game)
+{
+    std::string cmd = "INFO ver=" PLUGIN_VERSION;
+    for (auto& c : game) if (std::isspace((unsigned char)c)) c = '-';
+    if (!game.empty()) cmd += " game=" + game;
+    return cmd;
+}
+
+static void sendInfoBroadcast(const std::string& game)
+{
+    if (!s_pluginID || !s_sch) return;
+    ts3Functions.sendPluginCommand(s_sch, s_pluginID, infoCmd(game).c_str(),
+                                   PluginCommandTarget_SERVER, nullptr, nullptr);
+}
+
+static void sendInfoTo(anyID client, const std::string& game)
+{
+    if (!s_pluginID || !s_sch) return;
+    const anyID ids[2] = {client, 0};
+    ts3Functions.sendPluginCommand(s_sch, s_pluginID, infoCmd(game).c_str(),
+                                   PluginCommandTarget_CLIENT, ids, nullptr);
 }
 
 // ------------------------------------------------------- tunable settings ---
@@ -266,6 +313,64 @@ static void publishTalkers(uint64_t now)
     sendTalkMsg(buildTalkMsg(now)); // sent even when empty so mouths close promptly
 }
 
+// Start/stop the REST listener to match the bridge.enable/bridge.port
+// settings. Called from init and then the poll thread (~1s), so /rtr set,
+// the ini hot-reload, and the config dialog all apply live; a port change
+// restarts the listener; a busy port is retried at the same cadence
+// (logged throttled).
+static uint16_t s_httpPort = 0; // port the running listener is bound to
+static void syncHttpBridge()
+{
+    bool want;
+    uint16_t port;
+    {
+        std::lock_guard<std::mutex> lk(s_mtx);
+        want = s_settings.bridgeEnable >= 0.5f;
+        port = uint16_t(s_settings.bridgePort + 0.5f);
+    }
+    if (s_httpRunning && want && s_httpPort != port) {
+        s_http.stop();
+        s_httpRunning = false;
+        tsLog("http bridge restarting (bridge.port -> " + std::to_string(port) + ")");
+    }
+    if (want && !s_httpRunning) {
+        s_httpRunning = s_http.start(port,
+            [](const RtrSharedState& st, const std::string& gameId) {
+                if (!s_link.injectState(st, nowMs())) {
+                    static uint64_t lastIgnoreLogMs = 0; // bridge thread only
+                    const uint64_t now = nowMs();
+                    if (now - lastIgnoreLogMs > 10000) {
+                        lastIgnoreLogMs = now;
+                        tsLog("http state ignored: a native game link (shm/UDP) is active");
+                    }
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(s_mtx);
+                    s_bridgeGame = gameId;
+                }
+                maybeLogState(st);
+            },
+            [] { return buildTalkMsg(nowMs()); });
+        if (s_httpRunning) {
+            s_httpPort = port;
+            tsLog("http bridge listening on 127.0.0.1:" + std::to_string(port));
+        } else {
+            static uint64_t lastFailLogMs = 0;
+            const uint64_t now = nowMs();
+            if (lastFailLogMs == 0 || now - lastFailLogMs > 30000) {
+                lastFailLogMs = now;
+                tsLog("http bridge could not bind 127.0.0.1:" +
+                      std::to_string(port) + " (port in use?) - retrying");
+            }
+        }
+    } else if (!want && s_httpRunning) {
+        s_http.stop();
+        s_httpRunning = false;
+        tsLog("http bridge stopped (bridge.enable = 0)");
+    }
+}
+
 // Rename own TS nickname to the in-game name while playing (makes matching
 // obvious for humans; the HELLO handshake already handles it for the plugin).
 static std::string s_origNick; // restored when leaving the game
@@ -310,12 +415,14 @@ static void pollLoop()
     uint32_t lastFreq = 0;
     int micApplied = -1; // -1 = TS default (not gated), 0 = closed, 1 = open
     uint64_t lastActiveMs = 0; // last time the game link was active
+    uint64 infoSch = 0;        // connection the last INFO announce went to
+    std::string lastSentGame;  // game id in that announce
 
     int cfgTick = 0;
     while (s_running.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-        if (++cfgTick >= 20) { cfgTick = 0; reloadSettingsIfChanged(); }
+        if (++cfgTick >= 20) { cfgTick = 0; reloadSettingsIfChanged(); syncHttpBridge(); }
 
         // The plugin may load AFTER TS connected to a server, in which case no
         // connect event fires - resolve the active connection lazily.
@@ -348,6 +455,30 @@ static void pollLoop()
             tsLog("game mod speaks protocol v" + std::to_string(peerVer) +
                   " but this plugin expects v" + std::to_string(RTR_VERSION) +
                   " - update the game mod (mod and plugin ship as a pair)");
+        }
+
+        // Current game for the INFO announce / own info panel. Runs before the
+        // not-in-game bail-out: the announce must also go out when leaving.
+        {
+            std::string game;
+            if (ok) {
+                if (s_link.nativeFresh(nowMs())) game = "ready-or-not";
+                else { std::lock_guard<std::mutex> lk(s_mtx); game = s_bridgeGame; }
+            }
+            { std::lock_guard<std::mutex> lk(s_mtx); s_infoGame = game; }
+            if (s_sch != 0) {
+                bool changed = game != lastSentGame;
+                // Loading screens flap the link; hold the old game a while
+                // (same hysteresis as the nickname restore).
+                if (changed && game.empty() && lastActiveMs != 0 &&
+                    nowMs() - lastActiveMs <= 15000)
+                    changed = false;
+                if (s_sch != infoSch || changed) {
+                    sendInfoBroadcast(game);
+                    infoSch = s_sch;
+                    lastSentGame = game;
+                }
+            }
         }
 
         if (!ok || !st.inGame) {
@@ -445,33 +576,14 @@ RTR_EXPORT int ts3plugin_init()
 {
     initSettings();
     const bool shm = s_link.open(); // ok to fail now; poll() retries via snapshot staleness
-    std::string httpNote = ", http bridge disabled (build option)";
-#ifdef RTR_HTTP_BRIDGE
     s_http.setLogger([](const std::string& msg) { tsLog(msg); });
     s_http.setPluginVersion(PLUGIN_VERSION);
-    const bool http = s_http.start(RTR_HTTP_PORT,
-        [](const RtrSharedState& st) {
-            if (!s_link.injectState(st, nowMs())) {
-                static uint64_t lastIgnoreLogMs = 0; // bridge thread only
-                const uint64_t now = nowMs();
-                if (now - lastIgnoreLogMs > 10000) {
-                    lastIgnoreLogMs = now;
-                    tsLog("http state ignored: a native game link (shm/UDP) is active");
-                }
-                return;
-            }
-            maybeLogState(st);
-        },
-        [] { return buildTalkMsg(nowMs()); });
-    httpNote = http ? ", http bridge on 127.0.0.1:" + std::to_string(RTR_HTTP_PORT)
-                    : ", http bridge FAILED (port in use?)";
-#endif
+    syncHttpBridge(); // REST listener up-front if enabled; poll thread keeps it in sync
     s_running = true;
     s_pollThread = std::thread(pollLoop);
     tsLog(std::string("plugin loaded, shared memory ") +
           (shm ? "mapping present (game running, or another process still holds it)"
-               : "not present yet (start RoN with the mod)") +
-          httpNote);
+               : "not present yet (start RoN with the mod)"));
     return 0;
 }
 
@@ -479,9 +591,7 @@ RTR_EXPORT void ts3plugin_shutdown()
 {
     s_running = false;
     if (s_pollThread.joinable()) s_pollThread.join();
-#ifdef RTR_HTTP_BRIDGE
     s_http.stop();
-#endif
     s_link.close();
     if (s_pluginID) { free(s_pluginID); s_pluginID = nullptr; }
 }
@@ -507,8 +617,65 @@ RTR_EXPORT void ts3plugin_onTalkStatusChangeEvent(uint64 sch, int status,
 RTR_EXPORT void ts3plugin_onConnectStatusChangeEvent(uint64 sch, int newStatus, unsigned int /*err*/)
 {
     if (newStatus == STATUS_CONNECTION_ESTABLISHED) s_sch = sch;
-    if (newStatus == STATUS_DISCONNECTED && s_sch == sch) s_sch = 0;
+    if (newStatus == STATUS_DISCONNECTED && s_sch == sch) {
+        s_sch = 0;
+        // Client IDs are per-connection; a reconnect reuses them for
+        // different people, so stale entries would show wrong info.
+        std::lock_guard<std::mutex> lk(s_mtx);
+        s_clients.clear();
+    }
 }
+
+// Forget clients that leave the server (newChannelID 0 = disconnected), so a
+// reused client ID can't inherit the previous user's version/game.
+RTR_EXPORT void ts3plugin_onClientMoveEvent(uint64 /*sch*/, anyID clientID, uint64 /*oldChannelID*/,
+                                            uint64 newChannelID, int /*visibility*/, const char* /*moveMessage*/)
+{
+    if (newChannelID != 0) return;
+    std::lock_guard<std::mutex> lk(s_mtx);
+    s_clients.erase(clientID);
+}
+
+RTR_EXPORT void ts3plugin_onClientMoveTimeoutEvent(uint64 /*sch*/, anyID clientID, uint64 /*oldChannelID*/,
+                                                   uint64 /*newChannelID*/, int /*visibility*/, const char* /*timeoutMessage*/)
+{
+    std::lock_guard<std::mutex> lk(s_mtx);
+    s_clients.erase(clientID);
+}
+
+// ------------------------------------------------------------- info panel ---
+// Right-hand info frame when a client is selected in the tree: shows whether
+// they run this plugin, its version, and (optionally) the connected game.
+// Data arrives via the INFO plugin command; freeMemory is required by the SDK
+// for the info text to display at all.
+
+RTR_EXPORT const char* ts3plugin_infoTitle() { return PLUGIN_NAME; }
+
+RTR_EXPORT void ts3plugin_infoData(uint64 sch, uint64 id, enum PluginItemType type, char** data)
+{
+    if (type != PLUGIN_CLIENT) { *data = nullptr; return; }
+
+    std::string text;
+    anyID myID = 0;
+    if (ts3Functions.getClientID(sch, &myID) == ERROR_ok && (anyID)id == myID) {
+        std::lock_guard<std::mutex> lk(s_mtx);
+        text = "plugin v" PLUGIN_VERSION;
+        if (!s_infoGame.empty()) text += "\ngame: " + s_infoGame;
+    } else {
+        std::lock_guard<std::mutex> lk(s_mtx);
+        const auto it = s_clients.find((anyID)id);
+        if (it != s_clients.end() && it->second.infoKnown) {
+            text = "plugin v" + it->second.pluginVersion;
+            if (!it->second.game.empty()) text += "\ngame: " + it->second.game;
+        } else {
+            text = "plugin not detected";
+        }
+    }
+    *data = (char*)malloc(text.size() + 1);
+    if (*data) memcpy(*data, text.c_str(), text.size() + 1);
+}
+
+RTR_EXPORT void ts3plugin_freeMemory(void* data) { free(data); }
 
 // ------------------------------------------------ live tuning chat command ---
 // /rtr show | /rtr set <key> <value> | /rtr save | /rtr reload | /rtr reset
@@ -578,6 +745,21 @@ RTR_EXPORT void ts3plugin_onPluginCommandEvent(uint64 sch, const char* pluginNam
     if (cmd.rfind("HELLO ", 0) == 0) {
         rc.gameName = cmd.substr(cmd.find("name=") + 5);
         tsLog("mapped TS client '" + rc.nickname + "' -> game player '" + rc.gameName + "'");
+    } else if (cmd.rfind("INFO", 0) == 0) {
+        anyID myID = 0;
+        if (ts3Functions.getClientID(sch, &myID) == ERROR_ok && invokerClientID == myID)
+            return; // our own server-wide broadcast echoed back
+        const bool firstInfo = !rc.infoKnown;
+        rc.pluginVersion = cmdToken(cmd, "ver=");
+        if (rc.pluginVersion.empty()) rc.pluginVersion = "unknown";
+        rc.game = cmdToken(cmd, "game=");
+        rc.infoKnown = true;
+        // Late-join discovery: answer a newly-seen plugin user with our own
+        // INFO so both sides populate. Second-generation INFOs hit an
+        // already-known client and stop here — no echo loop.
+        if (firstInfo) sendInfoTo(invokerClientID, s_infoGame);
+        // Refresh the info panel if this client is currently selected.
+        ts3Functions.requestInfoUpdate(sch, PLUGIN_CLIENT, invokerClientID);
     } else if (cmd.rfind("TX_START ", 0) == 0) {
         rc.txFreqKhz = (uint32_t)std::stoul(cmd.substr(cmd.find("freq=") + 5));
     } else if (cmd.rfind("TX_STOP", 0) == 0) {
@@ -634,16 +816,25 @@ RTR_EXPORT void ts3plugin_onEditPostProcessVoiceDataEvent(
         if (spk == SPEAKER_FRONT_RIGHT || spk == SPEAKER_HEADPHONES_RIGHT) ri = c;
     }
 
-    // Radio path?
-    bool radio = false;
+    // Radio path? Union the ear routing of every matching slot: a speaker
+    // heard on a left-ear AND a right-ear radio plays in both.
+    bool radio = false, earL = false, earR = false;
     if (rc.txFreqKhz != 0)
-        for (uint32_t f : st.radioFreqKhz)
-            if (f != 0 && f == rc.txFreqKhz) { radio = true; break; }
+        for (int s = 0; s < RTR_MAX_RADIOS; ++s) {
+            if (st.radioFreqKhz[s] == 0 || st.radioFreqKhz[s] != rc.txFreqKhz) continue;
+            radio = true;
+            if (st.radioEars[s] == 1) earL = true;
+            else if (st.radioEars[s] == 2) earR = true;
+            else { earL = true; earR = true; } // 0 = both
+        }
 
     float gain = 1.0f, pan = 0.0f;
     const uint64_t now = nowMs();
     if (radio) {
         rc.radio.processMono(mono.data(), sampleCount, cfg.radioDrive, cfg.radioNoise);
+        // Ear routing via the pan stage: -1/+1 puts the constant-power writer
+        // fully on one output channel; both ears keeps today's centered mix.
+        if (earL != earR) pan = earL ? -1.0f : 1.0f;
     } else {
         const std::string& matchName = !rc.gameName.empty() ? rc.gameName : rc.nickname;
         const rtr::SpeakerAudio q = s_link.query(matchName);
@@ -653,6 +844,15 @@ RTR_EXPORT void ts3plugin_onEditPostProcessVoiceDataEvent(
                 tsLog("no game match for TS client '" + rc.nickname + "' (passthrough)");
             }
             return; // unmodded player: normal TS audio
+        }
+        // TFAR-style leveler first, on the raw voice: mic loudness evens out
+        // between speakers while distance attenuation below stays intact.
+        if (cfg.voiceComp >= 0.5f) {
+            rtr::CompressorParams cp;
+            cp.threshold = cfg.voiceCompThresh;
+            cp.ratio     = cfg.voiceCompRatio;
+            cp.makeup    = cfg.voiceCompMakeup;
+            rtr::applyCompressor(mono.data(), sampleCount, rc.comp, 48000.0f, cp);
         }
         gain = rtr::distanceGain(q.distM, {cfg.proxMaxDistM, cfg.proxRolloff});
         // Cap pan so a speaker dead to one side is still faintly audible in

@@ -1,0 +1,29 @@
+services:
+  state-viewer:
+    build: .
+    container_name: rontr-state-viewer
+    # Publish loopback-only on the bridge port so the game mod's POSTs to
+    # 127.0.0.1:39442 land here. Conflicts with a running TS plugin bridge —
+    # quit TeamSpeak, `/rtr set bridge.enable 0`, or move the plugin off the
+    # port and relay to it (see FORWARD below).
+    ports:
+      - "127.0.0.1:39442:39442"
+    # Relay mode: run TeamSpeak alongside the viewer by moving the plugin's
+    # bridge (`/rtr set bridge.port 39500`, `/rtr save`), then flip the
+    # relay on in the dashboard (target host.docker.internal:39500) — or
+    # start with it already on:
+    # environment:
+    #   FORWARD: "http://host.docker.internal:39500"
+    #
+    # Dev convenience: serve the working tree instead of the image copy, so
+    # `docker compose up` (no --build) always runs the current sources.
+    # index.html is read per request; server.js changes need `restart`.
+    volumes:
+      - ./server.js:/app/server.js:ro
+      - ./public:/app/public:ro
+    # host.docker.internal is built in on Docker Desktop; this makes it
+    # resolve on plain Linux Docker too (note: on Linux the plugin must then
+    # bind non-loopback, unlike Docker Desktop whose proxy reaches loopback).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

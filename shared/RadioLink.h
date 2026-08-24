@@ -41,7 +41,11 @@ typedef struct RtrSharedState {
     // Seqlock: writer sets odd before writing fields below, even when done.
     // Reader: read seq (retry if odd), copy struct, re-read seq, retry if changed.
     volatile uint32_t sequence;
-    uint32_t _pad0;
+    // Per-radio ear routing: 0 = both ears, 1 = left only, 2 = right only.
+    // Occupies what used to be 4 bytes of padding, so size/offsets (and
+    // RTR_VERSION) are unchanged; writers built before this field zero it,
+    // which means "both" — the previous behavior.
+    uint8_t  radioEars[RTR_MAX_RADIOS];
     uint64_t timestampMs;   // writer clock; reader treats data stale after ~1s
 
     uint8_t  inGame;        // 0 in menus -> plugin passes audio through untouched

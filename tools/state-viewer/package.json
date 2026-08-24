@@ -1,0 +1,10 @@
+{
+  "name": "rontr-state-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Dev dashboard that impersonates the RoNTR TS plugin's HTTP bridge and visualizes the game state a mod posts to it.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

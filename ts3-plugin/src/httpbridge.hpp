@@ -182,6 +182,19 @@ inline ParseResult parseStateText(const std::string& rawBody, RtrSharedState& ou
                 if (comma == std::string::npos) break;
                 p = comma + 1;
             }
+        } else if (key == "ears") { // comma list per radio slot: b/l/r (or 0/1/2)
+            uint32_t slot = 0;
+            size_t p = 0;
+            while (slot < RTR_MAX_RADIOS && p <= val.size()) {
+                const size_t comma = val.find(',', p);
+                const std::string e = val.substr(p, comma - p);
+                uint8_t mode = 0; // both
+                if (e == "l" || e == "L" || e == "1") mode = 1;
+                else if (e == "r" || e == "R" || e == "2") mode = 2;
+                out.radioEars[slot++] = mode;
+                if (comma == std::string::npos) break;
+                p = comma + 1;
+            }
         } else if (key == "activeradio") {
             const long a = std::strtol(val.c_str(), nullptr, 10);
             out.activeRadio = uint8_t(a < 0 ? 0 : (a >= RTR_MAX_RADIOS ? RTR_MAX_RADIOS - 1 : a));
@@ -222,7 +235,8 @@ inline std::string buildTalkText(const RtrTalkMsg& msg)
 
 class HttpBridge {
 public:
-    using StateSink  = std::function<void(const RtrSharedState&)>;
+    // gameId: the sender's game= identifier (sticky per connection, may be "").
+    using StateSink  = std::function<void(const RtrSharedState&, const std::string& gameId)>;
     using TalkSource = std::function<RtrTalkMsg()>;
     using Logger     = std::function<void(const std::string&)>;
 
@@ -383,7 +397,7 @@ private:
             m_gameId = gameId;
             if (m_log) m_log("http bridge: game '" + gameId + "' connected");
         }
-        if (m_onState) m_onState(st);
+        if (m_onState) m_onState(st, m_gameId);
         respond(client, "200 OK", m_talk ? buildTalkText(m_talk()) : "rtr=3\n");
     }
 

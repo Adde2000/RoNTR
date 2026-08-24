@@ -62,6 +62,10 @@ to avoid doubled audio.
 
 The TeamSpeak plugin can be configured using commands (Windows & Linux) or using the addon settings menu (Windows only for now). 
 
+Selecting a user in the TeamSpeak tree shows, in the info panel on the right,
+whether they run this plugin, its version, and the game they are currently
+connected to (if any).
+
 Run `/rtr show` in TeamSpeak to get a list of configurable options and their current values, run `/rtr set <key> <value>` to change a value. <br>This will be temporary and reset back to default when reloading the addon or restarting TS, unless you also run `/rtr save` to write the changes to file. 
 
 ## Build & deploy (automated)
